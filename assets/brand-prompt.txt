@@ -1,0 +1,15 @@
+给小雨的软件 — 品牌图标
+Created with OpenAI built-in image_gen tool (transparent_background: true).
+Generated on 2026-10-27. ICO derived from the original PNG using Pillow only for size/format conversion, retaining alpha.
+ICO sizes: 16, 24, 32, 48, 64, 128, 256.
+
+Exact generation prompt:
+Use case: logo-brand
+Asset type: Windows desktop application icon for a friendly Chinese bookkeeping assistant named 给小雨的软件
+Primary request: a single rounded blush-pink raindrop/cloud character gently holding a small cream-and-rose accounting ledger, with a tiny friendly face.
+Style/medium: refined cute cartoon illustration, soft clean contours, simple shapes, subtly dimensional, polished and gentle app branding.
+Composition/framing: centered square composition, a strong simple silhouette and generous safe margin, easily recognizable at 32 pixels.
+Color palette: rose pink, blush, warm cream, a restrained darker berry outline.
+Scene/backdrop: genuinely transparent background, preserve alpha.
+Text: no text.
+Constraints: one character only, no letters, numbers, watermark, extra characters, busy decoration, or opaque background. The ledger can have a few simple lines but no legible characters.
