@@ -29,6 +29,7 @@ from .imports import ImportResult, inspect_workbook, parse_workbook
 from .import_ui import MappingDialog, RecordsPage
 from .material_store import MaterialStore, export_materials
 from .theme import STYLESHEET
+from .update_ui import UpdateController
 
 
 EXCEL_FILTER = "Excel 表格 (*.xls *.xlsx)"
@@ -278,6 +279,9 @@ class MainWindow(QMainWindow):
             side.addWidget(button)
             self.nav_buttons[index] = button
         side.addStretch()
+        self.update_controller = UpdateController(self)
+        side.addWidget(self.update_controller.version_label)
+        side.addWidget(self.update_controller.check_button)
         outer.addWidget(sidebar)
         main = QVBoxLayout()
         main.setContentsMargins(27, 24, 27, 16)
@@ -299,6 +303,7 @@ class MainWindow(QMainWindow):
         self.subtitle = _label("选择 Excel，确认每列含义，核对资料后导出清单或生成账务凭证。", "subtitle", True)
         main.addWidget(self.eyebrow)
         main.addWidget(self.subtitle)
+        main.addWidget(self.update_controller.panel)
         self.steps_bar = QWidget()
         steps = QHBoxLayout(self.steps_bar)
         steps.setContentsMargins(0, 0, 0, 0)
@@ -1365,7 +1370,7 @@ class MainWindow(QMainWindow):
 
     def _save_settings(self):
         if self._updating:
-            return
+            return False
         options = {
             "period": self._current_period(),
             "bank_account": self._code(self.bank_account),
@@ -1391,6 +1396,8 @@ class MainWindow(QMainWindow):
             save_config(self._config)
         except Exception as exc:
             self.statusBar().showMessage(f"本次设置暂未保存：{exc}")
+            return False
+        return True
 
     def dragEnterEvent(self, event):
         if self.pages.currentIndex() == 4:
@@ -1419,13 +1426,34 @@ class MainWindow(QMainWindow):
         self._navigate(0)
         event.acceptProposedAction()
 
+    def _restart_for_update(self):
+        self._restart_after_update = True
+        try:
+            self.close()
+        finally:
+            self._restart_after_update = False
+
     def closeEvent(self, event):
         if self._busy:
             self._notify("正在处理文件，请等当前操作结束后再关闭。")
             event.ignore()
             return
+        if (self.update_controller.has_ready_update and self.ai_page is not None
+                and self.ai_page.is_busy):
+            self._notify("AI 助手正在处理，请等当前操作结束后再更新。")
+            event.ignore()
+            return
         self._save_timer.stop()
-        self._save_settings()
+        saved = self._save_settings()
+        if self.update_controller.has_ready_update and not saved:
+            self._notify("设置暂未保存，本次先不更新。请检查保存位置后重试。", "error")
+            event.ignore()
+            return
+        if not self.update_controller.prepare_close(
+                restart=getattr(self, "_restart_after_update", False)):
+            event.ignore()
+            return
+        self.update_controller.shutdown()
         if self.ai_page is not None:
             self.ai_page.shutdown()
         event.accept()
@@ -1436,6 +1464,33 @@ def run_app():
     app.setApplicationName("给小雨的软件")
     app.setOrganizationName("XiaoYuVoucher")
     app.setFont(QFont("Microsoft YaHei UI", 10))
-    window = MainWindow()
-    window.show()
-    return app.exec()
+    lock = None
+    if getattr(sys, 'frozen', False):
+        from .update_installer import AppLock, startup_recovery_command
+        app_dir = Path(sys.executable).parent
+        lock = AppLock(app_dir)
+        if not lock.acquire():
+            QMessageBox.information(None, '软件已经打开', '软件已在运行或正在更新，请稍后再打开。')
+            return 0
+        try:
+            recovery = startup_recovery_command(app_dir)
+            if recovery:
+                import subprocess
+                environment = {key: value for key, value in os.environ.items() if not key.startswith('_PYI_')}
+                environment['PYINSTALLER_RESET_ENVIRONMENT'] = '1'
+                subprocess.Popen(recovery, cwd=str(Path(recovery[0]).parent), env=environment,
+                                 creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+                lock.release()
+                return 0
+        except Exception:
+            lock.release()
+            raise
+    try:
+        window = MainWindow()
+        window.show()
+        # One check after the interface is ready. There is no periodic poll.
+        QTimer.singleShot(0, window.update_controller.startup_check)
+        return app.exec()
+    finally:
+        if lock is not None:
+            lock.release()

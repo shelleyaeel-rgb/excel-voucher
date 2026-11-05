@@ -13,6 +13,7 @@ from pathlib import Path
 def run_ai_smoke(app) -> dict:
     from .ai_service import AIResult, FinanceAIClient, GeneratedFile, UploadedFile
     from .ai_settings import AISettings, UsageLedger, load_settings, save_settings
+    from .ai_rules import load_rules, save_rules
     from .ai_ui import FinanceAIPage
 
     with tempfile.TemporaryDirectory(prefix="xiaoyu-ai-smoke-") as directory:
@@ -27,6 +28,10 @@ def run_ai_smoke(app) -> dict:
         assert settings.api_key not in (folder / "settings.json").read_text(encoding="utf-8")
         assert load_settings(folder / "settings.json").api_key == settings.api_key
         ledger = UsageLedger(folder / "usage.json")
+        rules_path = folder / "rules.json"
+        rules = "回答简洁，先给结论。"
+        save_rules(rules, rules_path)
+        assert load_rules(rules_path) == rules
         calls = []
 
         class OfflineClient:
@@ -43,9 +48,10 @@ def run_ai_smoke(app) -> dict:
                 return UploadedFile("file-smoke", source.name, len(original))
 
             def send(self, message, files, history, container_id=None,
-                     web_search=False, cancel=None, on_text=None, on_status=None):
+                     web_search=False, cancel=None, on_text=None, on_status=None, *, custom_rules=""):
                 assert [item.file_id for item in files] == ["file-smoke"]
                 assert "汇总" in message and not web_search
+                assert custom_rules == rules
                 calls.append("send")
                 if on_status:
                     on_status("正在处理合成测试资料")
@@ -67,7 +73,7 @@ def run_ai_smoke(app) -> dict:
 
         page = FinanceAIPage(settings=settings, ledger=ledger,
                              client_factory=OfflineClient,
-                             settings_path=folder / "page-settings.json")
+                             settings_path=folder / "page-settings.json", rules_path=rules_path)
         try:
             page.add_paths([str(source)])
             assert page.attachment_list.count() == 1
@@ -83,6 +89,8 @@ def run_ai_smoke(app) -> dict:
             assert calls[:2] == ["upload", "send"]
             assert ledger.summary()["requests"] == 1
             assert source.read_bytes() == original
+            page._clear_session()
+            assert page.custom_rules == rules
         finally:
             page.shutdown()
             page.close()
@@ -90,4 +98,5 @@ def run_ai_smoke(app) -> dict:
             app.processEvents()
     return {"mode": "offline_mock", "model": "gpt-6-luna",
             "upload_reply_generated_file": "passed", "source_unchanged": "passed",
-            "credential_encryption": "passed", "usage_ledger": "passed"}
+            "credential_encryption": "passed", "usage_ledger": "passed",
+            "persistent_rules": "passed"}

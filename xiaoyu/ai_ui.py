@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (
 
 from .ai_service import AIError, FinanceAIClient, RequestCancelled
 from .ai_settings import AISettings, UsageLedger, load_settings, save_settings, validate_settings
+from .ai_rules import MAX_RULES_CHARS, load_rules, save_rules, validate_rules
 
 
 UPLOAD_EXTENSIONS = {'.xlsx', '.csv', '.pdf', '.docx', '.pptx', '.txt', '.md', '.png', '.jpg', '.jpeg'}
@@ -84,6 +85,32 @@ def save_download(content: bytes, destination: Path, source_paths) -> Path:
         if temporary is not None and temporary.exists():
             temporary.unlink()
     return destination
+
+
+class MessageEdit(QPlainTextEdit):
+    send_requested = Signal()
+
+    def keyPressEvent(self, event):
+        if (event.key() not in (Qt.Key.Key_Return, Qt.Key.Key_Enter)
+                or not self.isEnabled() or self.isReadOnly()):
+            super().keyPressEvent(event)
+            return
+        if self.textCursor().block().layout().preeditAreaText():
+            # Candidate selection belongs to the input method, not chat shortcuts.
+            event.accept()
+            return
+
+        modifiers = event.modifiers() & ~Qt.KeyboardModifier.KeypadModifier
+        if modifiers & (Qt.KeyboardModifier.AltModifier | Qt.KeyboardModifier.ShiftModifier):
+            self.insertPlainText('\n')
+            event.accept()
+            return
+        if modifiers == Qt.KeyboardModifier.NoModifier:
+            event.accept()
+            if not event.isAutoRepeat():
+                self.send_requested.emit()
+            return
+        super().keyPressEvent(event)
 
 
 class _SafeDocument(QTextDocument):
@@ -213,15 +240,89 @@ class AISettingsDialog(QDialog):
         super().accept()
 
 
+class AIRulesDialog(QDialog):
+    def __init__(self, rules, rules_path=None, parent=None):
+        super().__init__(parent)
+        self.rules_path = rules_path
+        self.setWindowTitle('财务 AI 助手 · 长期规则')
+        self.setMinimumSize(580, 420)
+        self.resize(640, 460)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(22, 20, 22, 20)
+        layout.setSpacing(12)
+        layout.addWidget(_label('让助手按你的习惯回答', 'sectionTitle'))
+        layout.addWidget(_label('保存后，每次提问都会带上这些规则，新对话和重启软件后仍保留。'
+                                '规则保存在这台电脑，提问时会发送给 AI。', 'muted', True))
+        self.rules_edit = QPlainTextEdit()
+        self.rules_edit.setAccessibleName('长期规则内容')
+        self.rules_edit.setPlaceholderText('例如：\n回答简洁，先给结论，非必要不展开。\n'
+                                          '使用通俗中文，专业术语用一句话解释。\n'
+                                          '需要我操作时，用简短步骤说明。')
+        self.rules_edit.setPlainText(rules)
+        self.rules_edit.setStyleSheet('QPlainTextEdit {background:#FFFCFD;border:1px solid #ECCDDD;'
+                                     'border-radius:10px;padding:10px;selection-background-color:#EDBBD1;}'
+                                     'QPlainTextEdit:focus {border-color:#BA6A8C;}')
+        layout.addWidget(self.rules_edit, 1)
+        self.counter_label = _label('', 'small')
+        self.counter_label.setAlignment(Qt.AlignmentFlag.AlignRight)
+        layout.addWidget(self.counter_label)
+        layout.addWidget(_label('填写表达习惯、回答格式等通用要求。本次提问中的具体要求优先；'
+                                '留空并保存即可取消长期规则。', 'small', True))
+        self.error_label = _label('', 'notice', True)
+        self.error_label.setTextFormat(Qt.TextFormat.PlainText)
+        self.error_label.setProperty('tone', 'error')
+        self.error_label.hide()
+        layout.addWidget(self.error_label)
+        self.buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save |
+                                       QDialogButtonBox.StandardButton.Cancel |
+                                       QDialogButtonBox.StandardButton.Reset)
+        self.buttons.button(QDialogButtonBox.StandardButton.Save).setText('保存规则')
+        self.buttons.button(QDialogButtonBox.StandardButton.Save).setObjectName('primary')
+        self.buttons.button(QDialogButtonBox.StandardButton.Cancel).setText('取消')
+        self.buttons.button(QDialogButtonBox.StandardButton.Reset).setText('清空规则')
+        self.buttons.button(QDialogButtonBox.StandardButton.Reset).clicked.connect(self.rules_edit.clear)
+        self.buttons.accepted.connect(self.accept)
+        self.buttons.rejected.connect(self.reject)
+        layout.addWidget(self.buttons)
+        self.rules_edit.textChanged.connect(self._update_counter)
+        self._update_counter()
+
+    def value(self):
+        return self.rules_edit.toPlainText().strip()
+
+    def _update_counter(self):
+        count = len(self.value())
+        self.counter_label.setText(f'{count} / {MAX_RULES_CHARS} 字')
+        self.counter_label.setStyleSheet('color:#99502F;' if count > MAX_RULES_CHARS else '')
+
+    def accept(self):
+        try:
+            rules = self.value()
+            validate_rules(rules)
+            save_rules(rules, self.rules_path)
+        except (ValueError, OSError) as exc:
+            self.error_label.setText('规则未保存：' + str(exc))
+            self.error_label.show()
+            return
+        super().accept()
+
+
 class FinanceAIPage(QWidget):
     def __init__(self, parent=None, *, settings=None, ledger=None,
-                 client_factory=FinanceAIClient, settings_path=None):
+                 client_factory=FinanceAIClient, settings_path=None, rules_path=None):
         super().__init__(parent)
         self.setAcceptDrops(True)
         self.setStyleSheet('QListWidget::item:selected {color:#632E49;background:#F8DAE8;}')
         self.settings_path = settings_path
+        self.rules_path = rules_path
         self.client_factory = client_factory
         self._load_error = ''
+        self._rules_load_error = ''
+        try:
+            self.custom_rules = load_rules(rules_path)
+        except (ValueError, OSError) as exc:
+            self.custom_rules = ''
+            self._rules_load_error = str(exc)
         if settings is None:
             try:
                 settings = load_settings(settings_path)
@@ -245,12 +346,18 @@ class FinanceAIPage(QWidget):
         self._partial_text = ''
         self._current_message = ''
         self._build()
+        self._refresh_rules_summary()
         self._refresh_files()
         self._refresh_usage()
         self._render_chat()
         self._sync_controls()
+        errors = []
         if self._load_error:
-            self._status(self._load_error + ' 请打开连接设置重新配置。', error=True)
+            errors.append(self._load_error + ' 请打开连接设置重新配置。')
+        if self._rules_load_error:
+            errors.append(self._rules_load_error + ' 请打开“长期规则”重新保存或恢复备份。')
+        if errors:
+            self._status(' '.join(errors), error=True)
         elif not self.settings.api_key:
             self._status('首次使用请打开“连接设置”，填写 API 密钥。')
 
@@ -273,8 +380,15 @@ class FinanceAIPage(QWidget):
             title.addWidget(button)
         layout.addLayout(title)
         layout.addWidget(_label('仅处理你上传的文件，内容发送到 OpenAI 云端。生成结果请及时下载。', 'muted', True))
+        preferences = QHBoxLayout()
         self.usage_label = _label('', 'small', True)
-        layout.addWidget(self.usage_label)
+        preferences.addWidget(self.usage_label, 1)
+        self.rules_summary = _label('', 'small')
+        preferences.addWidget(self.rules_summary)
+        self.rules_button = _button('长期规则', self.open_rules)
+        self.rules_button.setToolTip('设置回答习惯，新对话和重启后继续使用。')
+        preferences.addWidget(self.rules_button)
+        layout.addLayout(preferences)
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.setHandleWidth(10)
         splitter.setStyleSheet('QSplitter::handle {margin:0;background:#FFF1F6;} '
@@ -313,7 +427,7 @@ class FinanceAIPage(QWidget):
         layout.addWidget(splitter, 1)
         self.attachment_list.currentRowChanged.connect(self._sync_controls)
         self.result_list.currentRowChanged.connect(self._sync_controls)
-        self.message_edit = QPlainTextEdit()
+        self.message_edit = MessageEdit()
         self.message_edit.setPlaceholderText('例如：按部门汇总这份工资表，并生成一个新的 Excel。\n也可以直接提问财务知识。')
         self.message_edit.setMinimumHeight(80)
         self.message_edit.setMaximumHeight(110)
@@ -326,8 +440,10 @@ class FinanceAIPage(QWidget):
         self.web_search_checkbox.setToolTip('开启后允许助手查询公开网页，会增加搜索费用。不要在搜索中填写个人敏感信息。')
         actions.addWidget(self.web_search_checkbox)
         actions.addStretch()
+        actions.addWidget(_label('Enter 发送 · Shift/Alt+Enter 换行', 'small'))
         self.cancel_button = _button('停止等待', self.cancel_request)
         self.send_button = _button('发送', self.send_message, primary=True)
+        self.message_edit.send_requested.connect(self.send_button.click)
         actions.addWidget(self.cancel_button)
         actions.addWidget(self.send_button)
         layout.addLayout(actions)
@@ -354,10 +470,19 @@ class FinanceAIPage(QWidget):
         except (ValueError, OSError):
             self.usage_label.setText('用量记录暂不可读取，发送前请检查记录文件。')
 
+    def _refresh_rules_summary(self):
+        if self._rules_load_error:
+            text = '规则读取失败'
+        elif self.custom_rules:
+            text = f'已启用 · {len(self.custom_rules)} 字'
+        else:
+            text = '未设置规则'
+        self.rules_summary.setText(text)
+
     def _sync_controls(self, *_):
         busy = self.is_busy or self._closed
         for control in (self.message_edit, self.settings_button, self.new_chat_button,
-                        self.attach_button, self.web_search_checkbox):
+                        self.attach_button, self.web_search_checkbox, self.rules_button):
             control.setEnabled(not busy)
         self.test_button.setEnabled(not busy and bool(self.settings.api_key))
         self.send_button.setEnabled(not busy and bool(self.message_edit.toPlainText().strip()))
@@ -507,6 +632,7 @@ class FinanceAIPage(QWidget):
         history = [dict(item) for item in self.history[-20:]]
         container_id = self.container_id
         web_search = self.web_search_checkbox.isChecked()
+        custom_rules = self.custom_rules
         self._current_message = message
         self._partial_text = ''
         self.messages.append(('user', message + ('\n附件：' + '、'.join(p.name for p in pending) if pending else '')))
@@ -530,6 +656,7 @@ class FinanceAIPage(QWidget):
                 job.request_started = True
                 return client.send(message, files, history, container_id=container_id,
                                    web_search=web_search, cancel=job.cancel,
+                                   custom_rules=custom_rules,
                                    on_text=lambda text: job.emit_safe(job.text, text),
                                    on_status=lambda text: job.emit_safe(job.status, text))
             finally:
@@ -644,6 +771,18 @@ class FinanceAIPage(QWidget):
         if self._current_job(job_id):
             self._job = None
             self._sync_controls()
+
+    def open_rules(self):
+        if self.is_busy or self._closed:
+            return
+        dialog = AIRulesDialog(self.custom_rules, self.rules_path, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        self.custom_rules = dialog.value()
+        self._rules_load_error = ''
+        self._refresh_rules_summary()
+        self._status('长期规则已保存，从下一次提问起生效，新对话也会继续使用。'
+                     if self.custom_rules else '长期规则已清空，之后的提问将不再附带自定义规则。')
 
     def open_settings(self):
         if self.is_busy:

@@ -1,6 +1,7 @@
 """Portable desktop entry point; --self-test also exercises bundled resources."""
 import argparse
 import json
+import os
 import sys
 import tempfile
 import traceback
@@ -9,7 +10,7 @@ from decimal import Decimal
 from pathlib import Path
 
 
-def self_test(report_path: str) -> int:
+def _self_test(report_path: str) -> int:
     from xiaoyu import __version__
     from xiaoyu.models import Options, Transaction
     from xiaoyu.engine import generate
@@ -124,12 +125,50 @@ def self_test(report_path: str) -> int:
     return 0 if report['ok'] else 1
 
 
+def _isolated_probe(function, report_path: str) -> int:
+    from xiaoyu import config
+    previous = config._TEST_DATA_DIR
+    with tempfile.TemporaryDirectory(prefix='xiaoyu-probe-') as directory:
+        config._TEST_DATA_DIR = Path(os.environ.get('XIAOYU_UPDATE_TEST_DATA') or directory)
+        try:
+            return function(report_path)
+        finally:
+            config._TEST_DATA_DIR = previous
+
+
+def self_test(report_path: str) -> int:
+    return _isolated_probe(_self_test, report_path)
+
+
+def _update_health_check(report_path: str) -> int:
+    from xiaoyu import __version__
+    from PySide6.QtWidgets import QApplication
+    from xiaoyu.ui import MainWindow
+    report = {'ok': False, 'version': __version__}
+    try:
+        app = QApplication.instance() or QApplication([])
+        window = MainWindow()
+        app.processEvents()
+        window.close()
+        window.deleteLater()
+        app.processEvents()
+        report['ok'] = True
+    except Exception:
+        report['error'] = traceback.format_exc()
+    Path(report_path).parent.mkdir(parents=True, exist_ok=True)
+    Path(report_path).write_text(json.dumps(report, ensure_ascii=False), encoding='utf-8')
+    return 0 if report['ok'] else 1
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description='给小雨的软件 — Excel 生成凭证')
     parser.add_argument('--self-test', metavar='REPORT_JSON', help='运行本地安装包自检并保存报告')
+    parser.add_argument('--update-health-check', metavar='REPORT_JSON', help='隔离验证更新后的界面能启动')
     args = parser.parse_args()
     if args.self_test:
         return self_test(args.self_test)
+    if args.update_health_check:
+        return _isolated_probe(_update_health_check, args.update_health_check)
     from xiaoyu.ui import run_app
     return run_app()
 

@@ -10,13 +10,15 @@ from types import SimpleNamespace
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
 
 import pytest
-from PySide6.QtCore import QByteArray, QUrl
-from PySide6.QtGui import QTextDocument
+from PySide6.QtCore import QByteArray, QEvent, Qt, QUrl
+from PySide6.QtGui import QInputMethodEvent, QKeyEvent, QTextCursor, QTextDocument
+from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QDialog, QFileDialog
 
 from xiaoyu import ai_ui
 from xiaoyu.ai_service import AIError, AIResult, GeneratedFile, RequestCancelled, UploadedFile
 from xiaoyu.ai_settings import AISettings, UsageLedger, load_settings
+from xiaoyu.ai_rules import MAX_RULES_CHARS, load_rules, save_rules
 
 
 @pytest.fixture(scope='module')
@@ -39,6 +41,7 @@ class OfflineClient:
     def __init__(self, settings):
         self.settings = settings
         self.uploads, self.sends, self.deleted = [], [], []
+        self.sent_rules = []
         self.cancel_send = False
         self.download_data = b'category,amount\nOffice,30\n'
         self.send_entered = threading.Event()
@@ -50,8 +53,9 @@ class OfflineClient:
         return UploadedFile('file-' + str(len(self.uploads)), Path(path).name, Path(path).stat().st_size)
 
     def send(self, message, files, history, container_id=None, web_search=False,
-             cancel=None, on_text=None, on_status=None):
+             cancel=None, on_text=None, on_status=None, *, custom_rules=''):
         self.sends.append((message, list(files), list(history), container_id, web_search))
+        self.sent_rules.append(custom_rules)
         self.send_entered.set()
         if self.cancel_send:
             assert cancel.wait(3)
@@ -88,6 +92,7 @@ def page_factory(app, tmp_path):
         kwargs.setdefault('ledger', UsageLedger(tmp_path / f'usage-{len(pages)}.json'))
         kwargs.setdefault('client_factory', OfflineClient)
         kwargs.setdefault('settings_path', tmp_path / f'settings-{len(pages)}.json')
+        kwargs.setdefault('rules_path', tmp_path / f'rules-{len(pages)}.json')
         page = ai_ui.FinanceAIPage(**kwargs)
         pages.append(page)
         return page
@@ -98,6 +103,89 @@ def page_factory(app, tmp_path):
         page.close()
         page.deleteLater()
     app.processEvents()
+
+
+@pytest.mark.parametrize('key,modifiers', [
+    (Qt.Key.Key_Return, Qt.KeyboardModifier.NoModifier),
+    (Qt.Key.Key_Enter, Qt.KeyboardModifier.KeypadModifier),
+])
+def test_enter_sends_once_through_page(page_factory, app, key, modifiers):
+    page = page_factory()
+    page.message_edit.setPlainText('汇总费用')
+    QTest.keyClick(page.message_edit, key, modifiers)
+    pump(app, lambda: not page.is_busy)
+    assert OfflineClient.instances[0].sends[0][0] == '汇总费用'
+    assert len(OfflineClient.instances[0].sends) == 1
+    assert page.message_edit.toPlainText() == ''
+
+
+@pytest.mark.parametrize('key', [Qt.Key.Key_Return, Qt.Key.Key_Enter])
+@pytest.mark.parametrize('modifiers', [
+    Qt.KeyboardModifier.ShiftModifier,
+    Qt.KeyboardModifier.AltModifier,
+    Qt.KeyboardModifier.ShiftModifier | Qt.KeyboardModifier.AltModifier,
+])
+def test_modified_enter_inserts_newline_at_selection(page_factory, key, modifiers):
+    page = page_factory()
+    page.message_edit.setPlainText('前中后')
+    cursor = page.message_edit.textCursor()
+    cursor.setPosition(1)
+    cursor.setPosition(2, QTextCursor.MoveMode.KeepAnchor)
+    page.message_edit.setTextCursor(cursor)
+    if key == Qt.Key.Key_Enter:
+        modifiers |= Qt.KeyboardModifier.KeypadModifier
+    QTest.keyClick(page.message_edit, key, modifiers)
+    assert page.message_edit.toPlainText() == '前\n后'
+    assert not OfflineClient.instances
+    page.message_edit.undo()
+    assert page.message_edit.toPlainText() == '前中后'
+
+
+def test_enter_ignores_empty_input_and_auto_repeat(page_factory):
+    page = page_factory()
+    QTest.keyClick(page.message_edit, Qt.Key.Key_Return)
+    assert page.message_edit.toPlainText() == ''
+    page.message_edit.setPlainText('  \n  ')
+    QTest.keyClick(page.message_edit, Qt.Key.Key_Return)
+    assert page.message_edit.toPlainText() == '  \n  '
+    page.message_edit.setPlainText('解释费用')
+    event = QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Return,
+                      Qt.KeyboardModifier.NoModifier, '\r', True)
+    QApplication.sendEvent(page.message_edit, event)
+    assert page.message_edit.toPlainText() == '解释费用'
+    assert not OfflineClient.instances
+
+
+def test_enter_during_chinese_composition_does_not_send(page_factory, app):
+    page = page_factory()
+    page.message_edit.setPlainText('解释')
+    page.message_edit.moveCursor(QTextCursor.MoveOperation.End)
+    QApplication.sendEvent(page.message_edit, QInputMethodEvent('fei', []))
+    QTest.keyClick(page.message_edit, Qt.Key.Key_Return)
+    assert not OfflineClient.instances
+    assert page.message_edit.toPlainText() == '解释'
+    commit = QInputMethodEvent()
+    commit.setCommitString('费用')
+    QApplication.sendEvent(page.message_edit, commit)
+    QTest.keyClick(page.message_edit, Qt.Key.Key_Return)
+    pump(app, lambda: not page.is_busy)
+    assert len(OfflineClient.instances[0].sends) == 1
+    assert OfflineClient.instances[0].sends[0][0] == '解释费用'
+
+
+def test_enter_does_not_send_again_while_busy(page_factory, app):
+    page = page_factory()
+    client = page._get_client()
+    client.release = threading.Event()
+    page.message_edit.setPlainText('解释费用')
+    try:
+        QTest.keyClick(page.message_edit, Qt.Key.Key_Return)
+        pump(app, client.send_entered.is_set)
+        QTest.keyClick(page.message_edit, Qt.Key.Key_Return)
+        assert len(client.sends) == 1
+    finally:
+        client.release.set()
+        pump(app, lambda: not page.is_busy)
 
 
 def test_selection_does_not_upload_and_missing_key_cannot_send(page_factory, tmp_path):
@@ -329,6 +417,7 @@ def test_main_window_ai_is_lazy_and_drop_does_not_enter_accounting(app, tmp_path
     monkeypatch.setattr(ui, 'load_config', lambda: {})
     monkeypatch.setattr(ui, 'save_config', lambda config: None)
     monkeypatch.setattr(ai_ui, 'load_settings', lambda path: loads.append(path) or AISettings())
+    monkeypatch.setattr(ai_ui, 'load_rules', lambda path: '')
     monkeypatch.setattr(ai_ui, 'UsageLedger', lambda: UsageLedger(tmp_path / 'usage.json'))
     window = ui.MainWindow(material_store=ui.MaterialStore(tmp_path / 'materials.sqlite3'))
     try:
@@ -353,3 +442,141 @@ def test_main_window_ai_is_lazy_and_drop_does_not_enter_accounting(app, tmp_path
         window.close()
         window.deleteLater()
         app.processEvents()
+
+
+def edit_rules(monkeypatch, page, text, *, save=True):
+    def execute(dialog):
+        dialog.rules_edit.setPlainText(text)
+        if save:
+            dialog.buttons.button(ai_ui.QDialogButtonBox.StandardButton.Save).click()
+        else:
+            dialog.reject()
+        return dialog.result()
+
+    monkeypatch.setattr(ai_ui.AIRulesDialog, 'exec', execute)
+    page.rules_button.click()
+
+
+def test_rules_save_without_key_and_survive_new_chat_and_restart(page_factory, app, tmp_path, monkeypatch):
+    rules_path = tmp_path / 'shared-rules.json'
+    page = page_factory(settings=AISettings(), rules_path=rules_path)
+    edit_rules(monkeypatch, page, '回答简洁，先给结论。\n需要操作时分步骤说明。')
+    assert load_rules(rules_path) == page.custom_rules
+    assert '已启用' in page.rules_summary.text()
+    assert '长期规则已保存' in page.status_label.text()
+    assert not page.settings_path.exists()  # Saving preferences never touches credentials.
+    page.history.append({'role': 'user', 'content': '之前的临时要求'})
+    page.messages.append(('user', '之前的临时要求'))
+    page.new_chat()
+    assert page.custom_rules == load_rules(rules_path)
+    assert not page.history and not page.messages
+    page.shutdown()
+    restarted = page_factory(rules_path=rules_path)
+    assert restarted.custom_rules == page.custom_rules
+    restarted.message_edit.setPlainText('解释预付账款')
+    restarted.send_message()
+    pump(app, lambda: not restarted.is_busy)
+    assert restarted.client.sent_rules == [page.custom_rules]
+
+
+def test_edit_and_clear_rules_apply_to_next_request_without_losing_chat(page_factory, app, monkeypatch):
+    page = page_factory()
+    edit_rules(monkeypatch, page, '回答简洁。')
+    page.message_edit.setPlainText('解释预付账款')
+    page.send_message()
+    pump(app, lambda: not page.is_busy)
+    client = page.client
+    old_history = list(page.history)
+    old_files = list(page.generated_files)
+    edit_rules(monkeypatch, page, '有操作时列出步骤。')
+    assert page.client is client and page.history == old_history
+    assert page.generated_files == old_files and page.container_id == 'cntr-test'
+    page.message_edit.setPlainText('那应该如何核对？')
+    page.send_message()
+    pump(app, lambda: not page.is_busy)
+    assert client.sent_rules == ['回答简洁。', '有操作时列出步骤。']
+    edit_rules(monkeypatch, page, '')
+    assert load_rules(page.rules_path) == '' and page.custom_rules == ''
+    assert '未设置' in page.rules_summary.text()
+    page.message_edit.setPlainText('继续说明')
+    page.send_message()
+    pump(app, lambda: not page.is_busy)
+    assert client.sent_rules[-1] == ''
+
+
+def test_rules_cancel_does_not_change_saved_or_active_rules(page_factory, monkeypatch):
+    page = page_factory()
+    edit_rules(monkeypatch, page, '回答简洁。')
+    before = page.rules_path.read_bytes()
+    edit_rules(monkeypatch, page, '不需要保存的修改', save=False)
+    assert page.custom_rules == '回答简洁。'
+    assert page.rules_path.read_bytes() == before
+
+
+def test_rules_save_failure_keeps_dialog_and_draft_for_retry(app, tmp_path, monkeypatch):
+    path = tmp_path / 'rules.json'
+    save_rules('原规则', path)
+    original = path.read_bytes()
+    dialog = ai_ui.AIRulesDialog('原规则', path)
+    dialog.show()
+    dialog.rules_edit.setPlainText('回答简洁，先给结论。')
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(ai_ui, 'save_rules', lambda *args: (_ for _ in ()).throw(OSError('文件被占用')))
+            dialog.accept()
+        assert dialog.isVisible() and dialog.result() != QDialog.DialogCode.Accepted
+        assert '规则未保存' in dialog.error_label.text()
+        assert dialog.value() == '回答简洁，先给结论。'
+        assert path.read_bytes() == original
+        dialog.accept()
+        assert dialog.result() == QDialog.DialogCode.Accepted
+        assert load_rules(path) == '回答简洁，先给结论。'
+    finally:
+        dialog.close()
+        dialog.deleteLater()
+        app.processEvents()
+
+
+def test_rules_length_limit_and_clear_button(app, tmp_path):
+    path = tmp_path / 'rules.json'
+    dialog = ai_ui.AIRulesDialog('', path)
+    try:
+        dialog.rules_edit.setPlainText('简' * (MAX_RULES_CHARS + 1))
+        dialog.accept()
+        assert dialog.result() != QDialog.DialogCode.Accepted
+        assert str(MAX_RULES_CHARS) in dialog.error_label.text()
+        assert not path.exists()
+        dialog.buttons.button(ai_ui.QDialogButtonBox.StandardButton.Reset).click()
+        assert dialog.value() == ''
+        dialog.accept()
+        assert load_rules(path) == ''
+    finally:
+        dialog.close()
+        dialog.deleteLater()
+        app.processEvents()
+
+
+def test_busy_request_disables_rules_editor(page_factory, app):
+    page = page_factory()
+    client = page._get_client()
+    client.release = threading.Event()
+    page.message_edit.setPlainText('解释科目')
+    page.send_message()
+    pump(app, client.send_entered.is_set)
+    assert not page.rules_button.isEnabled()
+    client.release.set()
+    pump(app, lambda: not page.is_busy)
+    assert page.rules_button.isEnabled()
+
+
+def test_corrupt_rules_remain_visible_until_successful_save(page_factory, tmp_path, monkeypatch):
+    path = tmp_path / 'broken-rules.json'
+    path.write_text('{broken', encoding='utf-8')
+    page = page_factory(rules_path=path)
+    assert '长期规则' in page.status_label.text() and '损坏' in page.status_label.text()
+    assert page.rules_summary.text() == '规则读取失败'
+    assert path.read_text(encoding='utf-8') == '{broken'
+    edit_rules(monkeypatch, page, '回答简洁。')
+    assert not page._rules_load_error
+    assert page.rules_summary.text().startswith('已启用')
+    assert load_rules(path) == '回答简洁。'

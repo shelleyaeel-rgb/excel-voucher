@@ -1,0 +1,4 @@
+{
+  "manifest_url": "https://downloads.example.com/xiaoyu/latest.json",
+  "public_key": "REPLACE_WITH_BASE64_ED25519_PUBLIC_KEY"
+}

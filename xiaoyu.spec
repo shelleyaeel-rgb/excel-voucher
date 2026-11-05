@@ -1,5 +1,6 @@
 # Build using: .venv\Scripts\python.exe -m PyInstaller --noconfirm xiaoyu.spec
 from pathlib import Path
+import os
 import ssl
 import sys
 root = Path(SPECPATH)
@@ -13,11 +14,16 @@ for source, _ in openssl_binaries:
 # Keep it beside the frozen ssl module; ordinary Python has no such file.
 ssl_companion = Path(ssl.__file__).with_name('codex-rejected-cas.pem')
 ssl_datas = [(str(ssl_companion), '.')] if ssl_companion.is_file() else []
+channel = root / 'assets' / 'update-channel.json'
+channel_datas = [(str(channel), 'assets')] if channel.is_file() else []
+helper = Path(os.environ.get('XIAOYU_HELPER_PATH', root / 'build' / 'helper' / 'update-helper.exe'))
+if not helper.is_file():
+    raise RuntimeError('请使用 scripts/build.ps1，先构建独立更新程序。')
 a = Analysis(
     [str(root / 'main.py')], pathex=[str(root)],
     binaries=openssl_binaries,
     datas=[(str(root / 'assets' / name), 'assets') for name in
-           ['logo.png', 'app.ico', '凭证导入模板.xls']] + ssl_datas,
+           ['logo.png', 'app.ico', '凭证导入模板.xls']] + ssl_datas + channel_datas + [(str(helper), '.')],
     hiddenimports=[], hookspath=[], hooksconfig={}, runtime_hooks=[],
     excludes=['PySide6.QtWebEngineCore', 'PySide6.QtWebEngineWidgets',
               'PySide6.QtQuick', 'PySide6.QtQml', 'tkinter', 'pytest'],

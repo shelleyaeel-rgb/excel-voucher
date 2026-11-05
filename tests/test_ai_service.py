@@ -9,6 +9,7 @@ from urllib.request import ProxyHandler
 import pytest
 
 from xiaoyu import ai_service as service
+from xiaoyu.ai_rules import MAX_RULES_CHARS
 from xiaoyu.ai_service import AIError, AIResult, FinanceAIClient, GeneratedFile, RequestCancelled, UploadedFile
 from xiaoyu.ai_settings import AISettings
 
@@ -159,6 +160,49 @@ def test_plain_question_does_not_enable_web_search_and_history_is_bounded():
     assert sum(len(item["content"]) for item in payload["input"][:-1]) <= service.MAX_HISTORY_CHARS
     assert all(item["role"] in {"user", "assistant"} for item in payload["input"])
     assert "本次未开启联网查询" in payload["instructions"]
+
+
+def test_long_term_rules_survive_history_limits_and_stay_at_user_priority():
+    ai, opener = client(sse(completed()))
+    history = [{"role": "user", "content": "旧消息" + "字" * 5000} for _ in range(40)]
+    rules = "按部门汇总费用，并保留两位小数。"
+    ai.send("本次改为按人员汇总。", [], history, custom_rules=rules)
+    payload = json.loads(opener.requests[0].data)
+    assert payload["instructions"].startswith(service.FINANCE_INSTRUCTIONS)
+    assert rules not in payload["instructions"]
+    assert payload["input"][-2]["role"] == "user"
+    assert rules in payload["input"][-2]["content"]
+    assert "以当前具体任务要求为准" in payload["input"][-2]["content"]
+    assert payload["input"][-1] == {"role": "user", "content": "本次改为按人员汇总。"}
+    assert sum(len(item["content"]) for item in payload["input"][:-2]) <= service.MAX_HISTORY_CHARS
+    assert len(payload["input"][:-2]) < len(history)
+    assert all(item["role"] in {"user", "assistant"} for item in payload["input"])
+
+
+def test_rules_sent_on_each_request_and_clearing_restores_plain_payload():
+    ai, opener = client(*(sse(completed()) for _ in range(4)))
+    rules = "输出表格增加部门小计。"
+    ai.send("汇总本月费用", [], [], custom_rules=rules)
+    ai.send("核对下月费用", [], [], custom_rules=rules)
+    ai.send("解释预付账款", [], [], custom_rules="")
+    ai.send("解释预付账款", [], [])
+    payloads = [json.loads(request.data) for request in opener.requests]
+    for payload in payloads[:2]:
+        assert len(payload["input"]) == 2
+        assert rules in payload["input"][0]["content"]
+        assert payload["input"][0]["role"] == "user"
+    assert payloads[2] == payloads[3]
+    assert payloads[2]["input"] == [{"role": "user", "content": "解释预付账款"}]
+    assert all(payload["instructions"] == payloads[0]["instructions"] for payload in payloads)
+
+
+@pytest.mark.parametrize("rules", [None, {}, 123, "字" * (MAX_RULES_CHARS + 1)])
+def test_invalid_long_term_rules_rejected_before_any_network_request(rules):
+    ai, opener = client()
+    with pytest.raises(AIError, match="长期规则") as error:
+        ai.send("核对费用", [], [], container_id="cntr-existing", custom_rules=rules)
+    assert not error.value.request_may_be_billed
+    assert opener.requests == []
 
 
 @pytest.mark.parametrize("status", ["active", "running"])

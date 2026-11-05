@@ -1,6 +1,7 @@
 """Test the final ZIP from a new path without developer PATH/PYTHONPATH entries."""
 from pathlib import Path, PurePosixPath
 import json
+import hashlib
 import os
 import subprocess
 import tempfile
@@ -40,7 +41,41 @@ def verify_archive(archive: Path):
             if z.testzip() is not None:
                 raise ValueError("压缩包完整性检查未通过。")
             validate_members(z)
+            try:
+                manifest = json.loads(z.read('❤/release-files.json'))
+                entries = manifest['files']
+            except (KeyError, ValueError, TypeError) as exc:
+                raise ValueError('压缩包缺少有效的程序文件清单。') from exc
+            if (manifest.get('schema') != 1 or manifest.get('app') != 'xiaoyu-voucher'
+                    or manifest.get('data_schema') != 1 or not isinstance(entries, dict)):
+                raise ValueError('程序文件清单不适用于本软件。')
+            actual = {str(PurePosixPath(name).relative_to('❤')) for name in z.namelist()
+                      if not name.endswith('/') and name != '❤/release-files.json'}
+            if set(entries) != actual:
+                raise ValueError('压缩包与程序文件清单不一致。')
+            for name, expected in entries.items():
+                if 'data' in (part.casefold() for part in PurePosixPath(name).parts):
+                    raise ValueError('发布包不得包含用户 data 目录。')
+                with z.open('❤/' + name) as stream:
+                    if hashlib.file_digest(stream, 'sha256').hexdigest() != expected:
+                        raise ValueError('程序文件校验失败：' + name)
             z.extractall(target)
+        # The independent helper has its own embedded trust anchor. Verify that
+        # a stale or externally supplied helper cannot silently use another key.
+        from PyInstaller.archive.readers import CArchiveReader
+        helper = target / '❤' / '_internal' / 'update-helper.exe'
+        if not helper.is_file():
+            raise ValueError('发行包缺少独立更新程序。')
+        reader = CArchiveReader(str(helper))
+        channel_names = [name for name in reader.toc
+                         if name.replace('\\', '/') == 'assets/update-channel.json']
+        channel_path = target / '❤' / '_internal' / 'assets' / 'update-channel.json'
+        if channel_path.exists():
+            if (len(channel_names) != 1
+                    or json.loads(reader.extract(channel_names[0])) != json.loads(channel_path.read_bytes())):
+                raise ValueError('主程序与独立更新程序的更新地址或公钥不一致。')
+        elif channel_names:
+            raise ValueError('主程序与独立更新程序的更新启用状态不一致。')
         env = {k: v for k, v in os.environ.items()
                if k.upper() in ('SYSTEMROOT', 'WINDIR', 'TEMP', 'TMP', 'LOCALAPPDATA', 'APPDATA', 'USERPROFILE')}
         env['PATH'] = str(Path(os.environ['SystemRoot']) / 'System32')
@@ -50,6 +85,8 @@ def verify_archive(archive: Path):
         assert process.returncode == 0, f'Portable self-test exited with {process.returncode}'
         result = json.loads(report.read_text(encoding='utf-8'))
         assert result['ok'], result
+        if result.get('version') != manifest.get('version'):
+            raise ValueError('新包程序版本与文件清单不一致。')
     return result
 
 
