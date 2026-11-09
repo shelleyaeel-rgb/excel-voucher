@@ -371,3 +371,184 @@ def test_delete_targets_only_explicit_uploaded_id():
     ai.delete_file("file-uploaded")
     assert opener.requests[0].method == "DELETE"
     assert opener.requests[0].full_url.endswith("/files/file-uploaded")
+
+
+class FakeCloudTools:
+    def __init__(self, execute_callback=None):
+        self.results = []
+        self.calls = []
+        self.execute_callback = execute_callback
+        self.private_token = "never-send-wps-secret"
+
+    def tool_definitions(self):
+        return [{"type": "function", "name": name, "strict": True,
+                 "description": "Only a bound cloud document.",
+                 "parameters": {"type": "object", "properties": {
+                     "document": {"type": "string", "minLength": 1},
+                     "count": {"type": "integer", "minimum": 1, "maximum": 100}},
+                     "required": ["document", "count"], "additionalProperties": False}}
+                for name in ("wps_read", "wps_apply")]
+
+    def instructions(self):
+        return "只操作本次绑定的云文档；按列名和业务单号匹配，用户行号可选。"
+
+    def execute(self, name, arguments, *, cancel=None, on_status=None):
+        self.calls.append((name, arguments))
+        if name == "wps_apply":
+            self.results.append({"task_id": "task-one", "status": "completed", "updated": arguments["count"]})
+        if self.execute_callback:
+            return self.execute_callback(self, name, arguments, cancel)
+        return {"ok": True, "document": arguments["document"]}
+
+
+def function_call(name="wps_read", call_id="call-one", arguments=None):
+    return {"id": "fc-" + call_id, "type": "function_call", "status": "completed",
+            "call_id": call_id, "name": name,
+            "arguments": arguments if arguments is not None else '{"document":"bound-one","count":1}'}
+
+
+def function_round(*calls, extra=(), container=None):
+    event = completed("", container=container)
+    event["response"]["output"] = [*extra, *event["response"]["output"][:-1], *calls]
+    return event
+
+
+def test_cloud_function_loop_replays_reasoning_outputs_and_aggregates_usage():
+    reasoning = {"id": "rs-one", "type": "reasoning", "summary": [], "encrypted_content": "opaque-encrypted-reasoning"}
+    adapter = FakeCloudTools()
+    ai, opener = client(sse(function_round(function_call(), extra=[reasoning], container="cntr-one")),
+                        sse(function_round(function_call("wps_apply", "call-two"), container="cntr-one")),
+                        sse(completed("已核对云文档更新。", container="cntr-one", annotations=[citation()])))
+    result = ai.send("按单号更新云文档", [UploadedFile("file-source", "来源.xlsx", 10)], [], cloud_tools=adapter)
+    assert [name for name, _ in adapter.calls] == ["wps_read", "wps_apply"]
+    assert result.text == "已核对云文档更新。"
+    assert (result.input_tokens, result.output_tokens, result.cached_input_tokens) == (360, 120, 60)
+    assert result.container_sessions == 1 and result.container_id == "cntr-one"
+    assert result.cloud_results == [{"task_id": "task-one", "status": "completed", "updated": 1}]
+    assert result.cloud_results is not adapter.results
+    assert result.files == [GeneratedFile("cntr-one", "cfile-result", "汇总.xlsx")]
+    payloads = [json.loads(request.data) for request in opener.requests]
+    assert all(payload["include"] == ["reasoning.encrypted_content"] for payload in payloads)
+    assert all(payload["store"] is False and payload["parallel_tool_calls"] is False for payload in payloads)
+    assert reasoning in payloads[1]["input"]
+    assert function_call() in payloads[1]["input"]
+    assert payloads[1]["input"][-1] == {"type": "function_call_output", "call_id": "call-one",
+        "output": json.dumps({"ok": True, "document": "bound-one"}, ensure_ascii=False)}
+    assert payloads[1]["tools"][0]["container"] == "cntr-one"
+    assert all("never-send-wps-secret" not in request.data.decode() for request in opener.requests)
+
+
+def test_function_calls_are_rejected_without_application_adapter():
+    ai, opener = client(sse(function_round(function_call())))
+    with pytest.raises(AIError, match="没有提供"):
+        ai.send("财务问题", [], [])
+    assert len(opener.requests) == 1
+
+
+@pytest.mark.parametrize("arguments", [
+    '[]', 'null', 'not json', '{"document":"one","document":"two","count":1}',
+    '{"document":"bound-one","count":true}', '{"document":"bound-one","count":101}',
+    '{"document":"bound-one","count":0}', '{"document":"bound-one"}',
+    '{"document":"bound-one","count":1,"endpoint":"https://elsewhere.invalid"}',
+    '{"document":"bound-one","count":NaN}', '{"document":"bound-one","count":1e999}',
+])
+def test_bad_function_arguments_never_reach_cloud_executor(arguments):
+    adapter = FakeCloudTools()
+    ai, opener = client(sse(function_round(function_call("wps_apply", arguments=arguments))))
+    with pytest.raises(AIError, match="参数"):
+        ai.send("按规则更新", [], [], cloud_tools=adapter)
+    assert adapter.calls == [] and adapter.results == []
+    assert len(opener.requests) == 1
+
+
+def test_unknown_tool_is_not_dispatched_or_echoed_to_user():
+    adapter = FakeCloudTools()
+    ai, _ = client(sse(function_round(function_call(name="private_exfiltration"))))
+    with pytest.raises(AIError, match="未提供") as failure:
+        ai.send("更新表格", [], [], cloud_tools=adapter)
+    assert adapter.calls == []
+    assert "private_exfiltration" not in str(failure.value)
+
+
+def test_repeated_call_id_uses_cached_result_without_second_write():
+    call = function_call("wps_apply")
+    adapter = FakeCloudTools()
+    ai, opener = client(sse(function_round(call)), sse(function_round(call)), sse(completed("核对完成")))
+    result = ai.send("更新表格", [], [], cloud_tools=adapter)
+    assert len(adapter.calls) == 1 and len(result.cloud_results) == 1
+    assert len(opener.requests) == 3
+    payload = json.loads(opener.requests[-1].data)
+    outputs = [item for item in payload["input"] if item.get("type") == "function_call_output"]
+    assert len(outputs) == 2 and outputs[0] == outputs[1]
+
+
+def test_repeated_call_id_with_changed_arguments_stops_and_keeps_completed_result():
+    adapter = FakeCloudTools()
+    ai, opener = client(sse(function_round(function_call("wps_apply"))),
+        sse(function_round(function_call("wps_apply", arguments='{"document":"bound-one","count":2}'))))
+    with pytest.raises(AIError, match="编号重复") as failure:
+        ai.send("更新表格", [], [], cloud_tools=adapter)
+    assert len(adapter.calls) == 1 and len(opener.requests) == 2
+    assert failure.value.cloud_results == adapter.results
+    assert failure.value.partial_result.input_tokens == 240
+
+
+def test_cancel_after_write_retains_result_and_does_not_execute_later_call():
+    cancelled = threading.Event()
+    def execute(adapter, name, arguments, cancel):
+        cancel.set()
+        return {"ok": True}
+    adapter = FakeCloudTools(execute)
+    ai, opener = client(sse(function_round(function_call("wps_apply"), function_call("wps_apply", "call-two"))))
+    with pytest.raises(RequestCancelled) as failure:
+        ai.send("更新表格", [], [], cloud_tools=adapter, cancel=cancelled)
+    assert len(adapter.calls) == 1 and len(opener.requests) == 1
+    assert failure.value.cloud_results == adapter.results
+    assert failure.value.partial_result.input_tokens == 120
+
+
+def test_final_narrative_failure_keeps_completed_cloud_write_and_known_usage():
+    adapter = FakeCloudTools()
+    ai, opener = client(sse(function_round(function_call("wps_apply"), container="cntr-one")),
+                        sse({"type": "response.failed", "response": {"error": {"code": "server_error"}}}))
+    with pytest.raises(AIError) as failure:
+        ai.send("更新表格", [], [], cloud_tools=adapter)
+    assert len(adapter.calls) == 1 and len(opener.requests) == 2
+    assert failure.value.cloud_results == adapter.results
+    assert failure.value.partial_result.container_id == "cntr-one"
+    assert failure.value.partial_result.container_sessions == 1
+    assert failure.value.partial_result.input_tokens == 120
+
+
+def test_executor_exception_is_sanitized_and_never_retried():
+    def execute(adapter, name, arguments, cancel):
+        raise OSError("secret token and private payroll")
+    adapter = FakeCloudTools(execute)
+    ai, opener = client(sse(function_round(function_call("wps_apply"))))
+    with pytest.raises(AIError, match="任务记录") as failure:
+        ai.send("更新表格", [], [], cloud_tools=adapter)
+    assert len(adapter.calls) == 1 and len(opener.requests) == 1
+    assert "secret" not in str(failure.value) and "payroll" not in str(failure.value)
+    assert failure.value.cloud_results == adapter.results
+
+
+def test_cloud_round_limit_keeps_completed_results(monkeypatch):
+    monkeypatch.setattr(service, "MAX_TOOL_ROUNDS", 2)
+    adapter = FakeCloudTools()
+    ai, opener = client(sse(function_round(function_call("wps_apply"))),
+                        sse(function_round(function_call("wps_apply", "call-two"))))
+    with pytest.raises(AIError, match="步骤上限") as failure:
+        ai.send("更新表格", [], [], cloud_tools=adapter)
+    assert len(adapter.calls) == 2 and len(opener.requests) == 2
+    assert len(failure.value.cloud_results) == 2
+
+
+def test_cloud_call_limit_stops_before_next_write(monkeypatch):
+    monkeypatch.setattr(service, "MAX_FUNCTION_CALLS", 2)
+    adapter = FakeCloudTools()
+    ai, opener = client(sse(function_round(function_call("wps_apply"),
+        function_call("wps_apply", "call-two"), function_call("wps_apply", "call-three"))))
+    with pytest.raises(AIError, match="步骤过多") as failure:
+        ai.send("更新表格", [], [], cloud_tools=adapter)
+    assert len(adapter.calls) == 2 and len(opener.requests) == 1
+    assert len(failure.value.cloud_results) == 2

@@ -1,7 +1,8 @@
-"""Independent upload-only financial assistant. No accounting-store access."""
+"""Financial assistant for selected uploads and explicitly linked cloud documents."""
 from __future__ import annotations
 
 import html
+import json
 import os
 import re
 import tempfile
@@ -13,20 +14,24 @@ from PySide6.QtCore import QByteArray, QObject, Qt, QUrl, Signal, Slot
 from PySide6.QtGui import QDesktopServices, QTextDocument
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox,
-    QFileDialog, QFormLayout, QFrame, QHBoxLayout, QLabel, QLineEdit,
+    QFileDialog, QFormLayout, QFrame, QGridLayout, QHBoxLayout, QLabel, QLineEdit,
     QListWidget, QListWidgetItem, QMessageBox, QPlainTextEdit, QPushButton,
-    QSizePolicy, QSpinBox, QSplitter, QTextBrowser, QVBoxLayout, QWidget,
+    QScrollArea, QSizePolicy, QSpinBox, QSplitter, QTabWidget, QTextBrowser, QVBoxLayout, QWidget,
 )
 
 from .ai_service import AIError, FinanceAIClient, RequestCancelled
 from .ai_settings import AISettings, UsageLedger, load_settings, save_settings, validate_settings
 from .ai_rules import MAX_RULES_CHARS, load_rules, save_rules, validate_rules
+from .config import data_dir
+from .wps_service import WpsError, extract_share_links, load_bindings, normalize_share_url
+from .wps_ui import WpsDocumentsDialog
 
 
 UPLOAD_EXTENSIONS = {'.xlsx', '.csv', '.pdf', '.docx', '.pptx', '.txt', '.md', '.png', '.jpg', '.jpeg'}
 DOWNLOAD_EXTENSIONS = UPLOAD_EXTENSIONS | {'.xls', '.zip'}
 MAX_FILE_BYTES = 20 * 1024 * 1024
 MAX_SESSION_FILES = 10
+MAX_TASK_RECORD_BYTES = 32 * 1024 * 1024
 FILE_FILTER = '文档和图片 (*.xlsx *.csv *.pdf *.docx *.pptx *.txt *.md *.png *.jpg *.jpeg)'
 
 
@@ -309,12 +314,28 @@ class AIRulesDialog(QDialog):
 
 class FinanceAIPage(QWidget):
     def __init__(self, parent=None, *, settings=None, ledger=None,
-                 client_factory=FinanceAIClient, settings_path=None, rules_path=None):
+                 client_factory=FinanceAIClient, settings_path=None, rules_path=None,
+                 wps_path=None, cloud_journal_dir=None, cloud_tools_factory=None):
         super().__init__(parent)
         self.setAcceptDrops(True)
         self.setStyleSheet('QListWidget::item:selected {color:#632E49;background:#F8DAE8;}')
         self.settings_path = settings_path
         self.rules_path = rules_path
+        self.wps_path = (Path(settings_path).parent / 'wps_documents.json'
+                         if wps_path is None and settings_path is not None else wps_path)
+        self.cloud_journal_dir = (Path(cloud_journal_dir) if cloud_journal_dir is not None else
+                                  (Path(settings_path).parent if settings_path is not None else data_dir()) / 'wps_tasks')
+        self.cloud_tools_factory = cloud_tools_factory
+        self._cloud_tools = None
+        self._cloud_links = []
+        self.cloud_results = []
+        self._clarification_buttons = []
+        self._wps_load_error = ''
+        try:
+            self.wps_bindings = load_bindings(self.wps_path)
+        except (WpsError, ValueError, OSError) as exc:
+            self.wps_bindings = []
+            self._wps_load_error = str(exc)
         self.client_factory = client_factory
         self._load_error = ''
         self._rules_load_error = ''
@@ -347,6 +368,7 @@ class FinanceAIPage(QWidget):
         self._current_message = ''
         self._build()
         self._refresh_rules_summary()
+        self._refresh_cloud_summary()
         self._refresh_files()
         self._refresh_usage()
         self._render_chat()
@@ -356,6 +378,8 @@ class FinanceAIPage(QWidget):
             errors.append(self._load_error + ' 请打开连接设置重新配置。')
         if self._rules_load_error:
             errors.append(self._rules_load_error + ' 请打开“长期规则”重新保存或恢复备份。')
+        if self._wps_load_error:
+            errors.append(self._wps_load_error + ' 请打开“云文档”检查连接配置。')
         if errors:
             self._status(' '.join(errors), error=True)
         elif not self.settings.api_key:
@@ -379,7 +403,7 @@ class FinanceAIPage(QWidget):
         for button in (self.new_chat_button, self.settings_button, self.test_button):
             title.addWidget(button)
         layout.addLayout(title)
-        layout.addWidget(_label('仅处理你上传的文件，内容发送到 OpenAI 云端。生成结果请及时下载。', 'muted', True))
+        layout.addWidget(_label('处理你上传的文件和本次关联的云文档，所需内容发送到 OpenAI 云端。生成文件请及时下载。', 'muted', True))
         preferences = QHBoxLayout()
         self.usage_label = _label('', 'small', True)
         preferences.addWidget(self.usage_label, 1)
@@ -389,6 +413,17 @@ class FinanceAIPage(QWidget):
         self.rules_button.setToolTip('设置回答习惯，新对话和重启后继续使用。')
         preferences.addWidget(self.rules_button)
         layout.addLayout(preferences)
+        cloud_row = QHBoxLayout()
+        self.cloud_summary = _label('', 'small', True)
+        cloud_row.addWidget(self.cloud_summary, 1)
+        self.cloud_mode = QComboBox()
+        self.cloud_mode.addItem('云文档：按要求自动处理', False)
+        self.cloud_mode.addItem('云文档：只预览，不写入', True)
+        self.cloud_mode.setToolTip('自动模式也仅在你明确要求更新时写入。行号可省略，按列名和业务编号匹配。')
+        cloud_row.addWidget(self.cloud_mode)
+        self.cloud_button = _button('云文档', self.open_cloud_documents)
+        cloud_row.addWidget(self.cloud_button)
+        layout.addLayout(cloud_row)
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.setHandleWidth(10)
         splitter.setStyleSheet('QSplitter::handle {margin:0;background:#FFF1F6;} '
@@ -400,7 +435,13 @@ class FinanceAIPage(QWidget):
         panel.setObjectName('card')
         panel.setMinimumWidth(230)
         side = QVBoxLayout(panel)
-        side.setContentsMargins(14, 14, 14, 14)
+        side.setContentsMargins(8, 8, 8, 8)
+        self.cloud_tabs = QTabWidget()
+        side.addWidget(self.cloud_tabs)
+        file_panel = QWidget()
+        self.cloud_tabs.addTab(file_panel, '文件')
+        side = QVBoxLayout(file_panel)
+        side.setContentsMargins(6, 8, 6, 8)
         attachment_header = QHBoxLayout()
         attachment_header.addWidget(_label('本次文件', 'sectionTitle'))
         attachment_header.addStretch()
@@ -409,26 +450,63 @@ class FinanceAIPage(QWidget):
         side.addLayout(attachment_header)
         side.addWidget(_label('可拖入 Excel、PDF、Word 等文件\n每个最多 20 MB，每次会话最多 10 个', 'small', True))
         self.attachment_list = QListWidget()
-        self.attachment_list.setMinimumHeight(100)
+        self.attachment_list.setMinimumHeight(80)
         side.addWidget(self.attachment_list, 1)
         self.remove_button = _button('移除选中的待发送文件', self.remove_selected_file)
         side.addWidget(self.remove_button)
         side.addWidget(_label('生成的文件', 'sectionTitle'))
         self.result_list = QListWidget()
-        self.result_list.setMinimumHeight(80)
+        self.result_list.setMinimumHeight(60)
         side.addWidget(self.result_list, 1)
         self.download_button = _button('下载选中的文件', self.download_selected)
         side.addWidget(self.download_button)
         side.addWidget(_label('云端文件约 20 分钟无活动后过期。\n已上传附件可在本次对话中继续使用。', 'small', True))
-        splitter.addWidget(panel)
+        cloud_panel = QWidget()
+        self.cloud_tabs.addTab(cloud_panel, '云文档')
+        side = QVBoxLayout(cloud_panel)
+        side.setContentsMargins(6, 8, 6, 8)
+        cloud_header = QHBoxLayout()
+        cloud_header.addWidget(_label('云文档处理结果', 'sectionTitle'))
+        cloud_header.addStretch()
+        self.cloud_history_button = _button('历史任务', self.show_cloud_history)
+        cloud_header.addWidget(self.cloud_history_button)
+        side.addLayout(cloud_header)
+        self.cloud_result_list = QListWidget()
+        self.cloud_result_list.setWordWrap(True)
+        self.cloud_result_list.setMinimumHeight(70)
+        cloud_actions = QHBoxLayout()
+        self.open_cloud_button = _button('打开云文档', self.open_cloud_result)
+        self.cloud_details_button = _button('修改明细', self.show_cloud_details)
+        cloud_actions.addWidget(self.open_cloud_button)
+        cloud_actions.addWidget(self.cloud_details_button)
+        side.addLayout(cloud_actions)
+        side.addWidget(self.cloud_result_list, 1)
+        side.addWidget(_label('只更新符合规则的单元格。\n历史任务保存在本机，关闭软件后仍可查看。', 'small', True))
+        side_scroll = QScrollArea()
+        side_scroll.setWidgetResizable(True)
+        side_scroll.setMinimumWidth(250)
+        side_scroll.setWidget(panel)
+        splitter.addWidget(side_scroll)
         splitter.setStretchFactor(0, 3)
         splitter.setStretchFactor(1, 1)
         splitter.setSizes([620, 260])
         layout.addWidget(splitter, 1)
         self.attachment_list.currentRowChanged.connect(self._sync_controls)
         self.result_list.currentRowChanged.connect(self._sync_controls)
+        self.cloud_result_list.currentRowChanged.connect(self._sync_controls)
+        self.question_panel = QFrame()
+        self.question_panel.setObjectName('card')
+        self.question_layout = QVBoxLayout(self.question_panel)
+        self.question_layout.setContentsMargins(10, 8, 10, 8)
+        self.question_scroll = QScrollArea()
+        self.question_scroll.setWidgetResizable(True)
+        self.question_scroll.setMinimumHeight(90)
+        self.question_scroll.setMaximumHeight(220)
+        self.question_scroll.setWidget(self.question_panel)
+        self.question_scroll.hide()
+        layout.addWidget(self.question_scroll)
         self.message_edit = MessageEdit()
-        self.message_edit.setPlaceholderText('例如：按部门汇总这份工资表，并生成一个新的 Excel。\n也可以直接提问财务知识。')
+        self.message_edit.setPlaceholderText('例如：按部门汇总工资表并生成 Excel。\n或粘贴已绑定的 WPS 链接，说明按哪个编号更新哪一列，无需填写行号。')
         self.message_edit.setMinimumHeight(80)
         self.message_edit.setMaximumHeight(110)
         self.message_edit.setStyleSheet('QPlainTextEdit {background:#FFFCFD;border:1px solid #ECCDDD;'
@@ -452,11 +530,27 @@ class FinanceAIPage(QWidget):
         layout.addWidget(self.status_label)
 
     def _status(self, text, error=False):
-        self.status_label.setText(str(text).replace(self.settings.api_key, '[密钥已隐藏]')
-                                  if self.settings.api_key else str(text))
+        self.status_label.setText(self._redact(text))
         self.status_label.setProperty('tone', 'error' if error else '')
         self.status_label.style().unpolish(self.status_label)
         self.status_label.style().polish(self.status_label)
+
+    def _redact(self, text):
+        value = str(text)
+        for key in (self.settings.api_key, *(item.token for item in self.wps_bindings)):
+            if key:
+                value = value.replace(key, '[密钥已隐藏]')
+        return value
+
+    def _refresh_cloud_summary(self):
+        if self._wps_load_error:
+            text = '云文档配置读取失败'
+        elif self._cloud_links:
+            names = [item.label for item in self.wps_bindings if item.share_url in self._cloud_links]
+            text = '本次云文档：' + '、'.join(names)
+        else:
+            text = f'已绑定 {len(self.wps_bindings)} 份 WPS 文档 · 在聊天中粘贴链接使用'
+        self.cloud_summary.setText(text)
 
     def _refresh_usage(self):
         try:
@@ -482,7 +576,8 @@ class FinanceAIPage(QWidget):
     def _sync_controls(self, *_):
         busy = self.is_busy or self._closed
         for control in (self.message_edit, self.settings_button, self.new_chat_button,
-                        self.attach_button, self.web_search_checkbox, self.rules_button):
+                        self.attach_button, self.web_search_checkbox, self.rules_button,
+                        self.cloud_button, self.cloud_mode, self.cloud_history_button):
             control.setEnabled(not busy)
         self.test_button.setEnabled(not busy and bool(self.settings.api_key))
         self.send_button.setEnabled(not busy and bool(self.message_edit.toPlainText().strip()))
@@ -490,15 +585,21 @@ class FinanceAIPage(QWidget):
         row = self.attachment_list.currentRow()
         self.remove_button.setEnabled(not busy and 0 <= row < len(self.pending_paths))
         self.download_button.setEnabled(not busy and self.result_list.currentRow() >= 0)
+        selected = 0 <= self.cloud_result_list.currentRow() < len(self.cloud_results)
+        self.open_cloud_button.setEnabled(not busy and selected)
+        self.cloud_details_button.setEnabled(not busy and selected)
+        for button in self._clarification_buttons:
+            button.setEnabled(not busy)
 
     def _render_chat(self):
         if not self.messages:
             self.transcript.setHtml('<h3 style="color:#96385E">今天需要处理什么？</h3>'
-                                    '<p>你可以询问财务知识，也可以上传文件，让助手分析或生成新的文档。</p>'
+                                    '<p>你可以询问财务知识，上传文件生成结果，或关联 WPS 云文档按规则更新。</p>'
                                     '<p style="color:#796571">例如：</p><ul>'
                                     '<li>解释“其他应收款”和“其他应付款”的区别。</li>'
                                     '<li>检查工资表的应发、扣款和实发是否一致。</li>'
-                                    '<li>生成一份带合计的费用报销汇总表。</li></ul>'
+                                    '<li>生成一份带合计的费用报销汇总表。</li>'
+                                    '<li>按业务单号，把来源表的实收金额更新到指定云文档。</li></ul>'
                                     '<p style="color:#796571">会话仅在本次打开期间保留。财务结论和金额请结合原始资料核对。</p>')
             return
         parts = ['<html><body style="font-family:Microsoft YaHei UI;color:#392F38">']
@@ -595,6 +696,52 @@ class FinanceAIPage(QWidget):
             self.client = self.client_factory(self.settings)
         return self.client
 
+    def _cloud_context_for(self, message, history):
+        if any(binding.token and binding.token in message for binding in self.wps_bindings):
+            raise ValueError('请不要把脚本令牌写在聊天里；令牌仅需填写在“云文档”连接设置中。')
+        links = extract_share_links(message)
+        historical_check = False
+        # A task number alone does not authorize reading local history. Resolve
+        # only an explicit request to check the named cloud-document task.
+        task_match = re.search(r'(?:核对|检查|查询|复核)\s*(?:一下)?\s*任务(?:编号)?\s*[:：]?\s*'
+                               r'([A-Fa-f0-9]{32})(?![A-Za-z0-9])', message)
+        if not links and task_match:
+            task_id = task_match.group(1).lower()
+            try:
+                root = self.cloud_journal_dir.resolve()
+                path = self.cloud_journal_dir / (task_id + '.json')
+                if (path.is_symlink() or not path.resolve().is_relative_to(root)
+                        or path.stat().st_size > MAX_TASK_RECORD_BYTES):
+                    raise ValueError('invalid task path')
+                record = json.loads(path.read_text(encoding='utf-8'))
+                if (not isinstance(record, dict) or type(record.get('schema')) is not int
+                        or record['schema'] != 1 or record.get('task_id') != task_id):
+                    raise ValueError('invalid task record')
+                links = [normalize_share_url(record.get('document_url', ''))]
+            except (WpsError, ValueError, OSError, TypeError):
+                raise ValueError('找不到这条有效的本机任务记录。请核对任务编号，或在“历史任务”中选择要检查的任务。') from None
+            historical_check = True
+        if links:
+            if self._wps_load_error:
+                raise ValueError('云文档配置读取失败，请先打开“云文档”检查。')
+            by_url = {normalize_share_url(binding.share_url): binding for binding in self.wps_bindings}
+            unknown = [link for link in links if link not in by_url]
+            if unknown:
+                raise ValueError('这次链接中有尚未绑定的 WPS 文档。请先打开“云文档”添加并只读测试，再发送这条要求。')
+            if links != self._cloud_links or self._cloud_tools is None or historical_check:
+                factory = self.cloud_tools_factory
+                if factory is None:
+                    from .cloud_tools import CloudDocumentTools
+                    factory = CloudDocumentTools
+                self._cloud_tools = factory([by_url[link] for link in links], allow_write=False,
+                                            journal_dir=self.cloud_journal_dir)
+                self._cloud_links = list(links)
+                self._refresh_cloud_summary()
+        if self._cloud_tools is not None:
+            self._cloud_tools.begin_turn(message, history=history,
+                                          force_preview=historical_check or bool(self.cloud_mode.currentData()))
+        return self._cloud_tools
+
     def _start_job(self, kind, function):
         self._job_counter += 1
         job = _Job(self._job_counter, kind, function)
@@ -623,8 +770,9 @@ class FinanceAIPage(QWidget):
         try:
             validate_settings(self.settings)
             self.ledger.check_budget(self.settings.monthly_limit_usd)
+            cloud_tools = self._cloud_context_for(message, self.history[-20:])
             client = self._get_client()
-        except (AIError, ValueError, OSError) as exc:
+        except (AIError, WpsError, ValueError, OSError) as exc:
             self._status(exc, error=True)
             return
         pending = list(self.pending_paths)
@@ -633,6 +781,7 @@ class FinanceAIPage(QWidget):
         container_id = self.container_id
         web_search = self.web_search_checkbox.isChecked()
         custom_rules = self.custom_rules
+        self._clear_cloud_questions()
         self._current_message = message
         self._partial_text = ''
         self.messages.append(('user', message + ('\n附件：' + '、'.join(p.name for p in pending) if pending else '')))
@@ -654,11 +803,12 @@ class FinanceAIPage(QWidget):
                 if job.cancel.is_set():
                     raise RequestCancelled()
                 job.request_started = True
+                options = {'cloud_tools': cloud_tools} if cloud_tools is not None else {}
                 return client.send(message, files, history, container_id=container_id,
                                    web_search=web_search, cancel=job.cancel,
                                    custom_rules=custom_rules,
                                    on_text=lambda text: job.emit_safe(job.text, text),
-                                   on_status=lambda text: job.emit_safe(job.status, text))
+                                   on_status=lambda text: job.emit_safe(job.status, text), **options)
             finally:
                 if job.abandon:
                     _cleanup_files(client, new_uploads)
@@ -679,7 +829,9 @@ class FinanceAIPage(QWidget):
     def cancel_request(self):
         if self._job:
             self._job.cancel.set()
-            self._status('正在停止等待；已发出的云端请求仍可能完成并产生费用。')
+            self._status('正在停止后续操作；已提交的云端请求仍可能完成。云文档结果请查看任务记录。'
+                         if self._cloud_tools is not None else
+                         '正在停止等待；已发出的云端请求仍可能完成并产生费用。')
             self._sync_controls()
 
     @Slot(int, str)
@@ -737,9 +889,16 @@ class FinanceAIPage(QWidget):
             self._refresh_files()
             if result.files:
                 self.result_list.setCurrentRow(len(self.generated_files) - 1)
+                self.cloud_tabs.setCurrentIndex(0)
             self._render_chat()
             self._refresh_usage()
-            self._status('处理完成。生成文件请及时下载，金额和结论请核对。' if result.files else '回答完成。')
+            cloud_results = getattr(result, 'cloud_results', [])
+            self._record_cloud_results(cloud_results)
+            self._show_cloud_questions()
+            if cloud_results:
+                self._status('云文档处理结果已记录：' + self._cloud_result_text(cloud_results[-1]))
+            else:
+                self._status('处理完成。生成文件请及时下载，金额和结论请核对。' if result.files else '回答完成。')
         elif kind == 'test':
             self._status(str(result) if not self._job.cancel.is_set() else '已停止等待连接测试。')
         elif kind == 'download':
@@ -749,10 +908,15 @@ class FinanceAIPage(QWidget):
     def _job_error(self, job_id, exc):
         if not self._current_job(job_id):
             return
-        text = str(exc) or '操作未完成，请稍后重试。'
-        if self.settings.api_key:
-            text = text.replace(self.settings.api_key, '[密钥已隐藏]')
+        text = self._redact(str(exc) or '操作未完成，请稍后重试。')
         if self._job.kind == 'send':
+            cloud_results = getattr(exc, 'cloud_results', [])
+            if not cloud_results and self._cloud_tools is not None:
+                cloud_results = getattr(self._cloud_tools, 'results', [])
+            self._record_cloud_results(cloud_results)
+            self._show_cloud_questions()
+            if cloud_results:
+                text += '\n云文档执行记录已保留：' + self._cloud_result_text(cloud_results[-1])
             if getattr(exc, 'request_may_be_billed', False):
                 try:
                     self.ledger.record(0, 0, uncertain=True)
@@ -783,6 +947,269 @@ class FinanceAIPage(QWidget):
         self._refresh_rules_summary()
         self._status('长期规则已保存，从下一次提问起生效，新对话也会继续使用。'
                      if self.custom_rules else '长期规则已清空，之后的提问将不再附带自定义规则。')
+
+    def open_cloud_documents(self):
+        if self.is_busy or self._closed:
+            return
+        dialog = WpsDocumentsDialog(self.wps_bindings, self.wps_path, self)
+        dialog.exec()
+        if dialog.changed:
+            self.wps_bindings = list(dialog.bindings)
+            self._wps_load_error = ''
+            self._cloud_tools = None
+            self._cloud_links = []
+            self._refresh_cloud_summary()
+            self._status('云文档连接已更新。请在聊天里粘贴目标链接并说明处理要求。')
+
+    def _clear_cloud_questions(self):
+        self._clarification_buttons.clear()
+        while self.question_layout.count():
+            item = self.question_layout.takeAt(0)
+            if item.widget() is not None:
+                item.widget().deleteLater()
+        self.question_scroll.hide()
+
+    def _show_cloud_questions(self):
+        self._clear_cloud_questions()
+        questions = getattr(self._cloud_tools, 'questions', []) if self._cloud_tools is not None else []
+        if not isinstance(questions, list):
+            return
+        shown = 0
+        for item in questions:
+            if not isinstance(item, dict) or not isinstance(item.get('question'), str) or not item['question'].strip():
+                continue
+            question = self._redact(item['question'])
+            card = QWidget()
+            box = QVBoxLayout(card)
+            box.setContentsMargins(0, 0, 0, 0)
+            label = _label(question, 'sectionTitle', True)
+            label.setTextFormat(Qt.TextFormat.PlainText)
+            box.addWidget(label)
+            choices = QGridLayout()
+            options = item.get('options', [])
+            if not isinstance(options, list):
+                options = []
+            for index, option in enumerate(options[:4]):
+                if not isinstance(option, str) or not option.strip():
+                    continue
+                option = self._redact(option)
+                caption = option if len(option) <= 28 else option[:27] + '…'
+                button = _button(caption.replace('&', '&&'))
+                button.setToolTip(option)
+                button.setAccessibleName(option)
+                button.clicked.connect(lambda checked=False, q=question, answer=option:
+                                       self._answer_cloud_question(q, answer))
+                choices.addWidget(button, index // 2, index % 2)
+                self._clarification_buttons.append(button)
+            box.addLayout(choices)
+            box.addWidget(_label('可点击选项发送，也可以在下方输入自己的回答。', 'small', True))
+            self.question_layout.addWidget(card)
+            shown += 1
+        self.question_scroll.setVisible(shown > 0)
+        self._sync_controls()
+
+    def _answer_cloud_question(self, question, answer):
+        if self.is_busy or self._closed:
+            return
+        self.message_edit.setPlainText(f'针对“{question}”：{answer}')
+        self.send_message()
+
+    @staticmethod
+    def _cloud_result_text(result):
+        if not isinstance(result, dict):
+            return '结果待核对'
+        def count(key):
+            value = result.get(key, 0)
+            return value if type(value) is int and value >= 0 else 0
+        current = result.get('current_check')
+        if isinstance(current, dict):
+            def checked_count(key):
+                value = current.get(key, 0)
+                return value if type(value) is int and value >= 0 else 0
+            differences = sum(checked_count(key) for key in ('changed', 'missing', 'duplicate'))
+            if current.get('failed') is True:
+                state = '历史结果已保留 · 本次核对未完成'
+            elif differences:
+                history = '历史更新已完成' if result.get('status') in ('completed', 'complete', 'success') else '历史结果已保留'
+                state = f'{history} · 当前有 {differences} 项不同/无法定位'
+            elif checked_count('checked') and checked_count('matched') == checked_count('checked'):
+                state = f"本次核对一致 · 共 {checked_count('matched')} 项"
+            elif not checked_count('checked'):
+                state = '历史结果已保留 · 本次没有可核对项目'
+            else:
+                state = '历史结果已保留 · 本次核对未完成'
+            return state + f" · 历史已核对更新 {count('updated')} 条"
+        labels = {'complete': '已核对完成', 'completed': '已核对完成', 'success': '已核对完成',
+                  'preview': '修改预览', 'prepared': '修改预览', 'running': '正在处理',
+                  'partial': '部分完成', 'unknown': '结果待核对', 'uncertain': '结果待核对',
+                  'failed': '未完成', 'cancelled': '已停止', 'conflict': '有冲突待处理'}
+        state = labels.get(result.get('status'), '请查看明细')
+        if count('unknown'):
+            state = '结果待核对'
+        elif count('conflicts') and state == '已核对完成':
+            state = '部分完成，有冲突'
+        if result.get('status') in ('prepared', 'preview') and isinstance(result.get('summary'), str):
+            return state + ' · ' + result['summary']
+        return (f"{state} · 更新 {count('updated')} · 未变化 {count('unchanged')}"
+                f" · 跳过 {count('skipped')} · 冲突 {count('conflicts')} · 待核对 {count('unknown')}")
+
+    def _record_cloud_results(self, results):
+        if not isinstance(results, list):
+            return
+        for result in results:
+            if not isinstance(result, dict):
+                continue
+            try:
+                normalize_share_url(result.get('document_url', ''))
+            except (WpsError, ValueError, TypeError):
+                continue
+            identity = (result.get('task_id'), result.get('document_url'))
+            old = next((i for i, item in enumerate(self.cloud_results)
+                        if identity[0] and (item.get('task_id'), item.get('document_url')) == identity), None)
+            if old is None:
+                self.cloud_results.append(dict(result))
+            else:
+                self.cloud_results[old] = dict(result)
+        self.cloud_result_list.clear()
+        for result in self.cloud_results:
+            name = str(result.get('document_name') or '云文档')
+            item = QListWidgetItem(name + '\n' + self._cloud_result_text(result))
+            item.setToolTip(self._redact(result.get('summary') or self._cloud_result_text(result)))
+            self.cloud_result_list.addItem(item)
+        if self.cloud_results:
+            self.cloud_result_list.setCurrentRow(len(self.cloud_results) - 1)
+            self.cloud_tabs.setCurrentIndex(1)
+        self._sync_controls()
+
+    def open_cloud_result(self):
+        row = self.cloud_result_list.currentRow()
+        if self.is_busy or not 0 <= row < len(self.cloud_results):
+            return
+        try:
+            url = normalize_share_url(self.cloud_results[row]['document_url'])
+        except (WpsError, ValueError, KeyError, TypeError):
+            self._status('任务记录中的文档链接无效。', error=True)
+            return
+        QDesktopServices.openUrl(QUrl(url))
+
+    def show_cloud_details(self):
+        row = self.cloud_result_list.currentRow()
+        if self.is_busy or not 0 <= row < len(self.cloud_results):
+            return
+        result = self.cloud_results[row]
+        record = result
+        detail_error = ''
+        if result.get('details_path'):
+            try:
+                path = Path(result['details_path'])
+                root = self.cloud_journal_dir.resolve()
+                if (path.is_symlink() or path.suffix.lower() != '.json'
+                        or not path.resolve().is_relative_to(root) or path.stat().st_size > MAX_TASK_RECORD_BYTES):
+                    raise ValueError('invalid journal path')
+                loaded = json.loads(path.read_text(encoding='utf-8'))
+                if not isinstance(loaded, dict):
+                    raise ValueError('invalid journal')
+                record = loaded
+            except (OSError, ValueError, TypeError):
+                detail_error = '\n\n详细记录暂不可读取。上方为已收到的执行结果。'
+        dialog = QDialog(self)
+        dialog.setWindowTitle('云文档修改明细')
+        dialog.resize(720, 540)
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(_label(self._cloud_result_text(result), 'notice', True))
+        editor = QPlainTextEdit()
+        editor.setReadOnly(True)
+        editor.setPlainText(self._redact(self._format_cloud_details(record) + detail_error))
+        layout.addWidget(editor, 1)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        dialog.exec()
+
+    @staticmethod
+    def _format_cloud_details(record):
+        lines = [
+            '任务编号：' + str(record.get('task_id', '')),
+            '文档：' + str(record.get('document_name', '')),
+            '工作表：' + str(record.get('sheet', '')),
+            '链接：' + str(record.get('document_url', '')),
+            FinanceAIPage._cloud_result_text(record),
+            str(record.get('summary', '')),
+        ]
+        if record.get('rule_summary'):
+            lines.append('处理规则：' + str(record['rule_summary']))
+        current = record.get('current_check')
+        if isinstance(current, dict):
+            lines.append('本次核对：' + '；'.join(f'{label} {current.get(key, 0)} 项' for key, label in (
+                ('checked', '检查'), ('matched', '一致'), ('changed', '已变化'),
+                ('missing', '未找到'), ('duplicate', '编号重复'))))
+        if record.get('created_at'):
+            lines.append('记录时间：' + str(record['created_at']))
+        status_names = {'applied': '已写入', 'verified': '已回读核对', 'unchanged': '未变化',
+                        'conflict': '原值有变化', 'not_found': '未找到', 'duplicate': '编号重复',
+                        'formula': '保留原公式', 'merged': '合并单元格跳过', 'unknown': '待核对',
+                        'pending': '待核对', 'planned': '待执行', 'skipped': '已跳过',
+                        'empty_key': '业务编号为空，已跳过', 'duplicate_source': '来源编号重复',
+                        'duplicate_target': '云表编号重复', 'blank_skipped': '来源空白，保留原值',
+                        'formula_text_unsupported': '公式样式文本暂不写入', 'not_submitted': '尚未提交'}
+        entries = record.get('items', [])
+        if not isinstance(entries, list) or not entries:
+            changes = record.get('changes', [])
+            entries = [item.get('request', item) for item in changes if isinstance(item, dict)] if isinstance(changes, list) else []
+        if entries:
+            lines.append('\n本次处理明细：')
+            for index, change in enumerate(entries[:2000]):
+                if not isinstance(change, dict):
+                    continue
+                key = change.get('key_values', [])
+                key_text = ' / '.join(str(value) for value in key) if isinstance(key, list) else str(key)
+                status = change.get('status', '')
+                explanation = status_names.get(status, status)
+                before = change.get('old_value', '')
+                after = change.get('new_value', '')
+                before = '（空白）' if before is None or before == '' else before
+                after = '（空白）' if after is None or after == '' else after
+                lines.append(f'{index + 1}. {key_text}：{before!s} → {after!s}' +
+                             (f'（{explanation}）' if explanation else ''))
+                if change.get('reason'):
+                    lines.append('   原因：' + str(change['reason']))
+            if len(entries) > 2000:
+                lines.append(f'共 {len(entries)} 项，窗口显示前 2000 项。')
+        if record.get('status') in ('running', 'uncertain', 'partial'):
+            lines.append('\n如需重新核对，在聊天中输入“核对任务编号 ' + str(record.get('task_id', '')) + '”。')
+        return '\n'.join(lines)
+
+    def show_cloud_history(self):
+        if self.is_busy or self._closed:
+            return
+        records = []
+        try:
+            root = self.cloud_journal_dir.resolve()
+            paths = sorted(self.cloud_journal_dir.glob('*.json'), key=lambda item: item.stat().st_mtime,
+                           reverse=True)[:200]
+            for path in paths:
+                if path.is_symlink() or not path.resolve().is_relative_to(root) or path.stat().st_size > MAX_TASK_RECORD_BYTES:
+                    continue
+                try:
+                    record = json.loads(path.read_text(encoding='utf-8'))
+                    if not isinstance(record, dict) or record.get('schema') != 1 or not isinstance(record.get('task_id'), str):
+                        continue
+                    normalize_share_url(record.get('document_url', ''))
+                    result = {key: record[key] for key in ('task_id', 'document_url', 'document_name', 'sheet',
+                              'status', 'summary', 'updated', 'unchanged', 'skipped', 'conflicts', 'unknown',
+                              'current_check') if key in record}
+                    result['details_path'] = str(path.resolve())
+                    records.append(result)
+                except (WpsError, ValueError, OSError, TypeError):
+                    continue
+        except OSError:
+            self._status('任务记录暂不可读取，请检查数据目录。', error=True)
+            return
+        if not records:
+            self._status('这台电脑还没有可查看的云文档任务记录。')
+            return
+        self._record_cloud_results(list(reversed(records)))
+        self._status(f'已载入最近 {len(records)} 条云文档任务，选择后可查看修改明细。')
 
     def open_settings(self):
         if self.is_busy:
@@ -832,6 +1259,12 @@ class FinanceAIPage(QWidget):
         self.uploaded_files.clear()
         self.source_paths.clear()
         self.generated_files.clear()
+        self._cloud_tools = None
+        self._cloud_links.clear()
+        self.cloud_results.clear()
+        self.cloud_result_list.clear()
+        self._clear_cloud_questions()
+        self._refresh_cloud_summary()
         self.history.clear()
         self.messages.clear()
         self.message_edit.clear()

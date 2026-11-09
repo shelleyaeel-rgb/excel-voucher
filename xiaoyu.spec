@@ -23,7 +23,7 @@ a = Analysis(
     [str(root / 'main.py')], pathex=[str(root)],
     binaries=openssl_binaries,
     datas=[(str(root / 'assets' / name), 'assets') for name in
-           ['logo.png', 'app.ico', '凭证导入模板.xls']] + ssl_datas + channel_datas + [(str(helper), '.')],
+           ['logo.png', 'app.ico', '凭证导入模板.xls', 'wps_airscript.js']] + ssl_datas + channel_datas + [(str(helper), '.')],
     hiddenimports=[], hookspath=[], hooksconfig={}, runtime_hooks=[],
     excludes=['PySide6.QtWebEngineCore', 'PySide6.QtWebEngineWidgets',
               'PySide6.QtQuick', 'PySide6.QtQml', 'tkinter', 'pytest'],

@@ -73,7 +73,8 @@ def run_ai_smoke(app) -> dict:
 
         page = FinanceAIPage(settings=settings, ledger=ledger,
                              client_factory=OfflineClient,
-                             settings_path=folder / "page-settings.json", rules_path=rules_path)
+                             settings_path=folder / "page-settings.json", rules_path=rules_path,
+                             wps_path=folder / "wps_documents.json", cloud_journal_dir=folder / "wps_tasks")
         try:
             page.add_paths([str(source)])
             assert page.attachment_list.count() == 1
@@ -96,7 +97,8 @@ def run_ai_smoke(app) -> dict:
             page.close()
             page.deleteLater()
             app.processEvents()
-    return {"mode": "offline_mock", "model": "gpt-6-luna",
+    from .wps_smoke import run_wps_smoke
+    return {"mode": "offline_mock", "model": "gpt-6-luna", "wps": run_wps_smoke(),
             "upload_reply_generated_file": "passed", "source_unchanged": "passed",
             "credential_encryption": "passed", "usage_ledger": "passed",
             "persistent_rules": "passed"}
