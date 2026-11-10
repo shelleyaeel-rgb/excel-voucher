@@ -21,6 +21,41 @@ def _text(value, *, wrap=True):
     return label
 
 
+class WpsLinkDialog(QDialog):
+    """Select a target without asking the user for technical connection details."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle('添加云文档')
+        self.setMinimumWidth(460)
+        layout = QVBoxLayout(self)
+        layout.addWidget(_text('粘贴金山文档的分享链接。发送处理要求后，软件会连接这份文档。'))
+        self.link_edit = QLineEdit()
+        self.link_edit.setAccessibleName('云文档分享链接')
+        self.link_edit.setPlaceholderText('https://www.kdocs.cn/l/…')
+        layout.addWidget(self.link_edit)
+        self.error_label = _text('')
+        self.error_label.hide()
+        layout.addWidget(self.error_label)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText('用于本次')
+        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText('取消')
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def value(self):
+        return normalize_share_url(self.link_edit.text().strip())
+
+    def accept(self):
+        try:
+            self.value()
+        except (WpsError, ValueError) as exc:
+            self.error_label.setText(str(exc))
+            self.error_label.show()
+            return
+        super().accept()
+
+
 class _Probe:
     """Pure Python I/O worker; the background thread never owns or touches Qt."""
     def __init__(self, binding, client_factory):
@@ -63,10 +98,10 @@ class WpsDocumentsDialog(QDialog):
         self._probe_timer.setInterval(20)
         self._probe_timer.timeout.connect(self._poll_probe)
         self.changed = False
-        self.setWindowTitle('财务 AI 助手 · WPS 云文档')
+        self.setWindowTitle('财务 AI 助手 · 旧版 WPS 连接设置')
         self.resize(760, 630)
         layout = QVBoxLayout(self)
-        layout.addWidget(_text('首次连接每份云文档，之后在聊天里粘贴链接并说明更新规则即可。'))
+        layout.addWidget(_text('这里保留旧版脚本连接。新文档可直接在财务 AI 中粘贴链接并登录 WPS。'))
         self.list = QListWidget()
         self.list.setMaximumHeight(125)
         self.list.currentRowChanged.connect(self._select)
@@ -120,7 +155,7 @@ class WpsDocumentsDialog(QDialog):
         for edit in (self.share_edit, self.endpoint_edit, self.token_edit):
             edit.textChanged.connect(self._invalidate)
         self._refresh()
-        if self.bindings:
+        if self.list.count():
             self.list.setCurrentRow(0)
         else:
             self.new_binding()
@@ -146,19 +181,21 @@ class WpsDocumentsDialog(QDialog):
         self._verified_name = ''
 
     def _refresh(self, selected_id=None):
+        self._visible_bindings = [item for item in self.bindings
+                                  if getattr(item, 'provider', 'airscript') == 'airscript']
         self.list.blockSignals(True)
         self.list.clear()
-        for binding in self.bindings:
+        for binding in self._visible_bindings:
             self.list.addItem(binding.label + ' · ' + binding.workbook_name)
         self.list.blockSignals(False)
         if selected_id is not None:
-            index = next((i for i, item in enumerate(self.bindings) if item.id == selected_id), -1)
+            index = next((i for i, item in enumerate(self._visible_bindings) if item.id == selected_id), -1)
             self.list.setCurrentRow(index)
 
     def _select(self, row):
-        if self.is_busy or not 0 <= row < len(self.bindings):
+        if self.is_busy or not 0 <= row < len(self._visible_bindings):
             return
-        binding = self.bindings[row]
+        binding = self._visible_bindings[row]
         self._editing_id = binding.id
         self.label_edit.setText(binding.label)
         self.share_edit.setText(binding.share_url)

@@ -109,13 +109,73 @@ def test_encrypt_failure_preserves_file(tmp_path, monkeypatch):
     assert path.read_text() == "existing"
 
 
-@pytest.mark.parametrize("content", ["{", "[]", '{"version":1,"documents":[{"token":"plain"}]}', '{"version":2,"documents":[]}'])
+@pytest.mark.parametrize("content", ["{", "[]", '{"version":1,"documents":[{"token":"plain"}]}', '{"version":3,"documents":[]}'])
 def test_bad_config_preserved(tmp_path, content):
     path = tmp_path / "wps.json"
     path.write_text(content, encoding="utf-8")
     with pytest.raises(wps.WpsError):
         wps.load_bindings(path)
     assert path.read_text(encoding="utf-8") == content
+
+
+def test_account_binding_roundtrip_has_no_account_credential(tmp_path, monkeypatch):
+    item = wps.WpsBinding("account-doc", "账号表", SHARE, workbook_name="测试.xlsx",
+                          provider="skillhub", account_id="account-1", file_id="file-123")
+    path = tmp_path / "wps.json"
+    def no_credential_access(*args):
+        raise AssertionError("Document bindings must not access account credentials")
+    monkeypatch.setattr(wps, "_encrypt_key", no_credential_access)
+    monkeypatch.setattr(wps, "_decrypt_key", no_credential_access)
+    wps.save_bindings([item], path)
+    persisted = json.loads(path.read_text(encoding="utf-8"))
+    assert persisted["version"] == 2
+    assert not {"token", "token_protected", "access_token", "refresh_token", "endpoint"}.intersection(persisted["documents"][0])
+    assert wps.load_bindings(path) == [item]
+    assert wps.binding_identity(item) == {"provider": "skillhub", "account_id": "account-1", "file_id": "file-123"}
+
+
+def test_account_binding_cannot_accidentally_use_legacy_transport():
+    item = wps.WpsBinding("account-doc", "账号表", SHARE, workbook_name="测试.xlsx",
+                          provider="skillhub", account_id="account-1", file_id="file-123")
+    with pytest.raises(wps.WpsError, match="WPS 账号连接"):
+        wps.WpsClient(item, Opener(result()))
+
+
+def test_legacy_v1_binding_migrates_without_losing_credentials(tmp_path, monkeypatch):
+    item = binding()
+    monkeypatch.setattr(wps, "_encrypt_key", lambda token: "protected:" + token)
+    monkeypatch.setattr(wps, "_decrypt_key", lambda token: token.removeprefix("protected:"))
+    path = tmp_path / "wps.json"
+    path.write_text(json.dumps({"version": 1, "documents": [{"id": item.id, "label": item.label,
+        "share_url": item.share_url, "endpoint": item.endpoint, "token_protected": "protected:" + item.token,
+        "workbook_name": item.workbook_name}]}), encoding="utf-8")
+    loaded = wps.load_bindings(path)
+    assert loaded == [item]
+    assert wps.binding_identity(loaded[0]) == {"provider": "airscript", "account_id": "", "file_id": "test_file"}
+    wps.save_bindings(loaded, path)
+    assert json.loads(path.read_text(encoding="utf-8"))["version"] == 2
+    assert wps.load_bindings(path) == [item]
+
+
+@pytest.mark.parametrize("bad", [{"token": "secret"}, {"endpoint": ENDPOINT}, {"account_id": ""},
+                                  {"file_id": ""}, {"file_id": "../../other"}, {"provider": "unknown"}])
+def test_account_binding_rejects_credentials_and_ambiguous_identity(bad):
+    fields = dict(id="account-doc", label="账号表", share_url=SHARE, workbook_name="测试.xlsx",
+                  provider="skillhub", account_id="account-1", file_id="file-123")
+    fields.update(bad)
+    with pytest.raises(wps.WpsError):
+        wps.validate_binding(wps.WpsBinding(**fields))
+
+
+@pytest.mark.parametrize("credential", ["token", "token_protected", "access_token", "refresh_token"])
+def test_account_binding_file_rejects_embedded_credentials(tmp_path, credential):
+    item = dict(id="account-doc", label="账号表", share_url=SHARE, provider="skillhub",
+                account_id="account-1", file_id="file-123", **{credential: "never-real-secret"})
+    path = tmp_path / "wps.json"
+    path.write_text(json.dumps({"version": 2, "documents": [item]}), encoding="utf-8")
+    with pytest.raises(wps.WpsError) as caught:
+        wps.load_bindings(path)
+    assert "never-real-secret" not in str(caught.value)
 
 
 def test_http_contract_and_unbound_describe():

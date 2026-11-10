@@ -50,7 +50,8 @@ class MemoryWps:
     def call(self, action, **payload):
         self.calls.append((action, deepcopy(payload)))
         if action == "describe":
-            return {"workbook_name": "模版.xlsx", "sheets": [{"name": SHEET,
+            return {"workbook_name": "模版.xlsx", "file_id": getattr(self, "file_id", None),
+                "can_edit": getattr(self, "can_edit", None), "sheets": [{"name": SHEET,
                 "used_start_row": 1, "used_end_row": max(self.rows), "used_start_column": 1,
                 "used_end_column": max(c["column"] for r in self.rows.values() for c in r)}]}
         if action == "read":
@@ -247,6 +248,30 @@ def test_sort_between_snapshot_and_commit_relocates_by_business_key(tmp_path):
     assert fake.at(3, 1)["value"] == "002" and fake.at(3, 2)["value"] == 20
     journal = json.loads((adapter.journal_dir / (plan["plan_id"] + ".json")).read_text(encoding="utf-8"))
     assert journal["items"][0]["verified_row"] == 4
+
+
+def test_last_response_error_with_all_changes_verified_is_complete_without_replay(tmp_path):
+    adapter, fake = tools(tmp_path)
+    plan = prepare(adapter, read(adapter))
+    fake.fail_apply_after = True
+    result = apply(adapter, plan)
+    assert result["status"] == "completed" and result["ok"]
+    assert result["updated"] == 1 and result["unknown"] == 0
+    assert fake.applied_requests == 1
+    assert apply(adapter, plan)["status"] == "completed" and fake.applied_requests == 1
+
+
+def test_readonly_check_closes_old_partial_record_when_every_item_was_verified(tmp_path):
+    adapter, fake = tools(tmp_path)
+    plan = prepare(adapter, read(adapter))
+    assert apply(adapter, plan)["status"] == "completed"
+    path = adapter.journal_dir / (plan["plan_id"] + ".json")
+    record = json.loads(path.read_text(encoding="utf8"))
+    record["status"] = "partial"
+    path.write_text(json.dumps(record, ensure_ascii=False), encoding="utf8")
+    checked = adapter.execute("wps_check_task", {"task_id": plan["plan_id"]})
+    assert checked["status"] == "completed" and checked["current_check"]["matched"] == 1
+    assert fake.applied_requests == 1
 
 
 def test_changed_filter_column_conflicts_and_does_not_overwrite(tmp_path):
@@ -528,6 +553,158 @@ def test_unresolved_file_is_blocked_through_another_share_link(tmp_path):
     second = prepare(alias, snapshot)
     result = apply(alias, second)
     assert result["ok"] is False and "尚未核对" in result["error"] and fake.applied_requests == 1
+
+
+def account_tools(tmp_path):
+    adapter, fake = tools(tmp_path)
+    adapter.bindings[URL] = WpsBinding("account-doc", "账号表", URL, workbook_name="模版.xlsx",
+        provider="skillhub", account_id="account-one", file_id="real-file-1")
+    return adapter, fake
+
+
+@pytest.mark.parametrize("field,value", [("account_id", "account-two"), ("file_id", "real-file-2")])
+def test_plan_rejects_account_or_real_file_change_before_submission(tmp_path, field, value):
+    adapter, fake = account_tools(tmp_path)
+    plan = prepare(adapter, read(adapter))
+    setattr(adapter.bindings[URL], field, value)
+    result = apply(adapter, plan)
+    assert result["ok"] is False and "绑定已变化" in result["error"]
+    assert fake.applied_requests == 0
+    checked = adapter.execute("wps_check_task", {"task_id": plan["plan_id"]})
+    assert not checked["ok"]
+    assert ("身份" if field == "file_id" else "真实云文档") in checked["error"]
+
+
+def test_old_snapshot_cannot_prepare_updates_after_account_change(tmp_path):
+    adapter, fake = account_tools(tmp_path)
+    snapshot = read(adapter)
+    adapter.bindings[URL].account_id = "account-two"
+    with pytest.raises(AssertionError, match="绑定已变化"):
+        prepare(adapter, snapshot)
+    assert not adapter.plans and fake.applied_requests == 0
+
+
+def test_plan_rejects_provider_change_even_with_same_file_id(tmp_path):
+    adapter, fake = tools(tmp_path)
+    plan = prepare(adapter, read(adapter))
+    adapter.bindings[URL] = WpsBinding("account-doc", "账号表", URL, workbook_name="模版.xlsx",
+        provider="skillhub", account_id="account-one", file_id="example-doc")
+    result = apply(adapter, plan)
+    assert result["ok"] is False and "绑定已变化" in result["error"] and fake.applied_requests == 0
+
+
+def test_new_journal_preserves_full_provider_identity_without_credentials(tmp_path):
+    adapter, fake = account_tools(tmp_path)
+    plan = prepare(adapter, read(adapter))
+    record = json.loads((adapter.journal_dir / (plan["plan_id"] + ".json")).read_text(encoding="utf-8"))
+    assert record["schema"] == 2
+    assert record["document_identity"] == {"provider": "skillhub", "account_id": "account-one", "file_id": "real-file-1"}
+    assert "endpoint_file_id" not in record and "token" not in json.dumps(record)
+    assert "account-one" not in adapter.instructions() and "real-file-1" not in adapter.instructions()
+    assert apply(adapter, plan)["status"] == "completed"
+
+
+def test_legacy_journal_is_checkable_and_blocks_unresolved_alias(tmp_path):
+    adapter, fake = tools(tmp_path)
+    plan = prepare(adapter, read(adapter))
+    fake.fail_apply_before = True
+    assert apply(adapter, plan)["status"] == "uncertain"
+    record = adapter.plans[plan["plan_id"]]
+    record["schema"] = 1
+    record["endpoint_file_id"] = record.pop("document_identity")["file_id"]
+    adapter._save(record)
+    alias_binding = deepcopy(adapter.bindings[URL])
+    alias_binding.share_url = "https://www.kdocs.cn/l/new-alias"
+    alias = CloudDocumentTools([alias_binding], allow_write=True,
+        journal_dir=adapter.journal_dir, client_factory=fake.factory)
+    second = prepare(alias, read(alias, document_url=alias_binding.share_url))
+    assert "尚未核对" in apply(alias, second)["error"]
+    checked = adapter.execute("wps_check_task", {"task_id": plan["plan_id"]})
+    assert checked["status"] == "uncertain" and fake.applied_requests == 1
+
+
+def test_unknown_account_write_blocks_same_real_file_through_share_alias(tmp_path):
+    adapter, fake = account_tools(tmp_path)
+    plan = prepare(adapter, read(adapter))
+    fake.fail_apply_before = True
+    assert apply(adapter, plan)["status"] == "uncertain"
+    binding = deepcopy(adapter.bindings[URL])
+    binding.share_url = "https://www.kdocs.cn/l/account-alias"
+    alias = CloudDocumentTools([binding], allow_write=True,
+        journal_dir=adapter.journal_dir, client_factory=fake.factory)
+    second = prepare(alias, read(alias, document_url=binding.share_url))
+    assert "尚未核对" in apply(alias, second)["error"]
+    assert fake.applied_requests == 1
+
+
+@pytest.mark.parametrize("provider", ["skillhub", "airscript"])
+def test_unknown_write_cannot_be_bypassed_by_account_or_provider_and_alias(tmp_path, provider):
+    adapter, fake = account_tools(tmp_path)
+    first = prepare(adapter, read(adapter))
+    fake.fail_apply_before = True
+    assert apply(adapter, first)["status"] == "uncertain"
+    other_url = "https://www.kdocs.cn/l/new-account-alias"
+    if provider == "skillhub":
+        binding = WpsBinding("new-account-doc", "账号表", other_url, workbook_name="模版.xlsx",
+            provider=provider, account_id="account-two", file_id="real-file-1")
+    else:
+        binding = WpsBinding("legacy-doc", "账号表", other_url,
+            "https://www.kdocs.cn/api/v3/ide/file/real-file-1/script/legacy-script/sync_task",
+            "fake-token", "模版.xlsx")
+    reopened = CloudDocumentTools([binding], allow_write=True,
+        journal_dir=adapter.journal_dir, client_factory=fake.factory)
+    second = prepare(reopened, read(reopened, document_url=other_url))
+    assert "尚未核对" in apply(reopened, second)["error"]
+    assert fake.applied_requests == 1
+
+
+def test_new_login_can_read_reconcile_same_file_alias_without_reusing_old_plan(tmp_path):
+    adapter, fake = account_tools(tmp_path)
+    first = prepare(adapter, read(adapter))
+    old_prepared = prepare(adapter, read(adapter))
+    fake.fail_apply_before = True
+    assert apply(adapter, first)["status"] == "uncertain"
+    fake.file_id = "real-file-1"
+    fake.at(3, 2)["value"] = 30  # A previously timed-out request finished later.
+    binding = deepcopy(adapter.bindings[URL])
+    binding.account_id = "account-two"
+    binding.share_url = "https://www.kdocs.cn/l/new-login-alias"
+    reopened = CloudDocumentTools([binding], allow_write=True,
+        journal_dir=adapter.journal_dir, client_factory=fake.factory)
+    checked = reopened.execute("wps_check_task", {"task_id": first["plan_id"]})
+    assert checked["ok"] and checked["updated"] == 1
+    assert fake.applied_requests == 1
+    record = json.loads((adapter.journal_dir / (first["plan_id"] + ".json")).read_text(encoding="utf-8"))
+    assert record["document_identity"]["account_id"] == "account-one"
+    assert not reopened.execute("wps_check_task", {"task_id": old_prepared["plan_id"]})["ok"]
+    assert "修改计划不存在" in apply(reopened, old_prepared)["error"]
+    assert fake.applied_requests == 1
+    adapter.bindings[URL].account_id = "account-two"
+    assert "绑定已变化" in apply(adapter, old_prepared)["error"]
+
+
+def test_new_login_cannot_reconcile_if_server_file_identity_differs(tmp_path):
+    adapter, fake = account_tools(tmp_path)
+    plan = prepare(adapter, read(adapter))
+    adapter.bindings[URL].account_id = "account-two"
+    fake.file_id = "another-real-file"
+    before = (adapter.journal_dir / (plan["plan_id"] + ".json")).read_bytes()
+    checked = adapter.execute("wps_check_task", {"task_id": plan["plan_id"]})
+    assert not checked["ok"] and "真实云文档" in checked["error"]
+    assert (adapter.journal_dir / (plan["plan_id"] + ".json")).read_bytes() == before
+    assert fake.applied_requests == 0
+
+
+def test_document_metadata_exposes_permission_and_sheet_names_without_identity(tmp_path):
+    adapter, fake = account_tools(tmp_path)
+    fake.file_id, fake.can_edit = "real-file-1", True
+    inspected = adapter.execute("wps_inspect", {"document_url": URL, "sheet": None})
+    assert inspected["ok"]
+    assert adapter.document_metadata[URL] == {"can_edit": True, "sheets": [SHEET]}
+    assert "real-file-1" not in json.dumps(inspected)
+    fake.can_edit = False
+    read(adapter)
+    assert adapter.document_metadata[URL]["can_edit"] is False
 
 
 def test_restart_closes_running_journal_before_first_submission_without_write(tmp_path):

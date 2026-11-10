@@ -4,13 +4,15 @@ from __future__ import annotations
 import html
 import json
 import os
+import queue
 import re
 import tempfile
 import threading
 from dataclasses import replace
+from functools import partial
 from pathlib import Path
 
-from PySide6.QtCore import QByteArray, QObject, Qt, QUrl, Signal, Slot
+from PySide6.QtCore import QByteArray, QObject, QTimer, Qt, QUrl, Signal, Slot
 from PySide6.QtGui import QDesktopServices, QTextDocument
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox,
@@ -24,7 +26,7 @@ from .ai_settings import AISettings, UsageLedger, load_settings, save_settings, 
 from .ai_rules import MAX_RULES_CHARS, load_rules, save_rules, validate_rules
 from .config import data_dir
 from .wps_service import WpsError, extract_share_links, load_bindings, normalize_share_url
-from .wps_ui import WpsDocumentsDialog
+from .wps_ui import WpsDocumentsDialog, WpsLinkDialog
 
 
 UPLOAD_EXTENSIONS = {'.xlsx', '.csv', '.pdf', '.docx', '.pptx', '.txt', '.md', '.png', '.jpg', '.jpeg'}
@@ -179,6 +181,37 @@ class _Job(QObject):
             self.emit_safe(self.finished)
 
 
+class _CloudConnectionJob:
+    """Only plain Python state crosses the login worker/UI boundary."""
+    def __init__(self, service, links, *, resume_message=None):
+        self.service = service
+        self.links = list(links)
+        self.resume_message = resume_message
+        self.cancel = threading.Event()
+        self.events = queue.SimpleQueue()
+        self.result = None
+        self.error = None
+        self.launch_error = None
+        self.thread = threading.Thread(target=self._run, name='XiaoYuWpsConnect', daemon=True)
+
+    def _run(self):
+        try:
+            on_status = lambda value: self.events.put(('status', str(value)))
+            try:
+                connected = self.service.status().get('connected')
+            except (WpsError, ValueError, OSError):
+                connected = False
+            if not connected:
+                self.service.connect(cancel=self.cancel, on_status=on_status,
+                                     open_url=lambda value: self.events.put(('open_url', str(value))))
+            if self.cancel.is_set():
+                raise RequestCancelled()
+            self.result = (self.service.resolve_documents(self.links, cancel=self.cancel, on_status=on_status)
+                           if self.links else self.service.list_documents())
+        except Exception as exc:
+            self.error = exc
+
+
 class AISettingsDialog(QDialog):
     def __init__(self, settings, remember_key=False, parent=None):
         super().__init__(parent)
@@ -315,12 +348,15 @@ class AIRulesDialog(QDialog):
 class FinanceAIPage(QWidget):
     def __init__(self, parent=None, *, settings=None, ledger=None,
                  client_factory=FinanceAIClient, settings_path=None, rules_path=None,
-                 wps_path=None, cloud_journal_dir=None, cloud_tools_factory=None):
+                 wps_path=None, cloud_journal_dir=None, cloud_tools_factory=None,
+                 wps_account_service=None):
         super().__init__(parent)
         self.setAcceptDrops(True)
         self.setStyleSheet('QListWidget::item:selected {color:#632E49;background:#F8DAE8;}')
         self.settings_path = settings_path
         self.rules_path = rules_path
+        if wps_path is None:
+            wps_path = getattr(wps_account_service, 'documents_path', None)
         self.wps_path = (Path(settings_path).parent / 'wps_documents.json'
                          if wps_path is None and settings_path is not None else wps_path)
         self.cloud_journal_dir = (Path(cloud_journal_dir) if cloud_journal_dir is not None else
@@ -328,6 +364,21 @@ class FinanceAIPage(QWidget):
         self.cloud_tools_factory = cloud_tools_factory
         self._cloud_tools = None
         self._cloud_links = []
+        self._selected_cloud_links = []
+        self._connection_job = None
+        self._connection_timer = QTimer(self)
+        self._connection_timer.setInterval(40)
+        self._connection_timer.timeout.connect(self._poll_cloud_connection)
+        self._account_error = ''
+        self.wps_account_service = wps_account_service or None
+        if wps_account_service is None:
+            try:
+                from .wps_skillhub import WpsAccountService
+                account_path = (Path(settings_path).parent / 'wps_account.json'
+                                if settings_path is not None else None)
+                self.wps_account_service = WpsAccountService(path=account_path, documents_path=self.wps_path)
+            except (ImportError, WpsError, ValueError, OSError) as exc:
+                self._account_error = str(exc)
         self.cloud_results = []
         self._clarification_buttons = []
         self._wps_load_error = ''
@@ -336,6 +387,11 @@ class FinanceAIPage(QWidget):
         except (WpsError, ValueError, OSError) as exc:
             self.wps_bindings = []
             self._wps_load_error = str(exc)
+        if self.wps_account_service is not None:
+            try:
+                self._merge_cloud_bindings(self.wps_account_service.list_documents())
+            except (WpsError, ValueError, OSError) as exc:
+                self._account_error = str(exc)
         self.client_factory = client_factory
         self._load_error = ''
         self._rules_load_error = ''
@@ -387,7 +443,7 @@ class FinanceAIPage(QWidget):
 
     @property
     def is_busy(self):
-        return self._job is not None
+        return self._job is not None or self._connection_job is not None
 
     def _build(self):
         layout = QVBoxLayout(self)
@@ -398,8 +454,8 @@ class FinanceAIPage(QWidget):
         title.addWidget(_label('Luna · 云端处理', 'muted'))
         title.addStretch()
         self.new_chat_button = _button('新对话', self.new_chat)
-        self.settings_button = _button('连接设置', self.open_settings)
-        self.test_button = _button('测试连接', self.test_connection)
+        self.settings_button = _button('AI 连接设置', self.open_settings)
+        self.test_button = _button('测试 AI 连接', self.test_connection)
         for button in (self.new_chat_button, self.settings_button, self.test_button):
             title.addWidget(button)
         layout.addLayout(title)
@@ -413,42 +469,89 @@ class FinanceAIPage(QWidget):
         self.rules_button.setToolTip('设置回答习惯，新对话和重启后继续使用。')
         preferences.addWidget(self.rules_button)
         layout.addLayout(preferences)
-        cloud_row = QHBoxLayout()
-        self.cloud_summary = _label('', 'small', True)
-        cloud_row.addWidget(self.cloud_summary, 1)
-        self.cloud_mode = QComboBox()
-        self.cloud_mode.addItem('云文档：按要求自动处理', False)
-        self.cloud_mode.addItem('云文档：只预览，不写入', True)
-        self.cloud_mode.setToolTip('自动模式也仅在你明确要求更新时写入。行号可省略，按列名和业务编号匹配。')
-        cloud_row.addWidget(self.cloud_mode)
-        self.cloud_button = _button('云文档', self.open_cloud_documents)
-        cloud_row.addWidget(self.cloud_button)
-        layout.addLayout(cloud_row)
-        splitter = QSplitter(Qt.Orientation.Horizontal)
-        splitter.setHandleWidth(10)
-        splitter.setStyleSheet('QSplitter::handle {margin:0;background:#FFF1F6;} '
-                              'QSplitter::handle:horizontal {width:10px;margin:0;}')
+        self.main_splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.main_splitter.setHandleWidth(10)
+        self.main_splitter.setChildrenCollapsible(False)
+        self.main_splitter.setStyleSheet('QSplitter::handle {margin:0;background:#FFF1F6;}')
+        chat_panel = QWidget()
+        chat = QVBoxLayout(chat_panel)
+        chat.setContentsMargins(0, 0, 0, 0)
+        chat.setSpacing(8)
         self.transcript = SafeTranscript()
         self.transcript.setMinimumWidth(320)
-        splitter.addWidget(self.transcript)
-        panel = QFrame()
-        panel.setObjectName('card')
-        panel.setMinimumWidth(230)
-        side = QVBoxLayout(panel)
-        side.setContentsMargins(8, 8, 8, 8)
+        chat.addWidget(self.transcript, 1)
+        self.question_panel = QFrame()
+        self.question_panel.setObjectName('card')
+        self.question_layout = QVBoxLayout(self.question_panel)
+        self.question_layout.setContentsMargins(10, 8, 10, 8)
+        self.question_scroll = QScrollArea()
+        self.question_scroll.setWidgetResizable(True)
+        self.question_scroll.setMinimumHeight(80)
+        self.question_scroll.setMaximumHeight(180)
+        self.question_scroll.setWidget(self.question_panel)
+        self.question_scroll.hide()
+        chat.addWidget(self.question_scroll)
+        self.cloud_chip = QFrame()
+        self.cloud_chip.setObjectName('card')
+        chip_row = QHBoxLayout(self.cloud_chip)
+        chip_row.setContentsMargins(8, 4, 8, 4)
+        self.cloud_chip_label = _label('', 'small', True)
+        self.cloud_chip_label.setTextFormat(Qt.TextFormat.PlainText)
+        chip_row.addWidget(self.cloud_chip_label, 1)
+        self.cloud_chip_button = _button('查看', lambda: self.cloud_tabs.setCurrentIndex(1))
+        chip_row.addWidget(self.cloud_chip_button)
+        self.cloud_chip.hide()
+        chat.addWidget(self.cloud_chip)
+        self.message_edit = MessageEdit()
+        self.message_edit.setPlaceholderText('描述要处理的内容，或粘贴 WPS 云文档链接。\n例如：按业务单号更新到账金额，未匹配的数据保留，无需填写行号。')
+        self.message_edit.setMinimumHeight(80)
+        self.message_edit.setMaximumHeight(110)
+        self.message_edit.setStyleSheet('QPlainTextEdit {background:#FFFCFD;border:1px solid #ECCDDD;'
+                                       'border-radius:10px;padding:8px;selection-background-color:#EDBBD1;}')
+        self.message_edit.textChanged.connect(self._message_changed)
+        chat.addWidget(self.message_edit)
+        input_tools = QHBoxLayout()
+        self.input_attach_button = _button('上传文件', self.choose_files)
+        self.add_cloud_button = _button('添加云文档', self.add_cloud_link)
+        input_tools.addWidget(self.input_attach_button)
+        input_tools.addWidget(self.add_cloud_button)
+        input_tools.addStretch()
+        self.web_search_checkbox = QCheckBox('联网核实政策和来源')
+        self.web_search_checkbox.setToolTip('开启后允许助手查询公开网页，会增加搜索费用。不要在搜索中填写个人敏感信息。')
+        input_tools.addWidget(self.web_search_checkbox)
+        chat.addLayout(input_tools)
+        actions = QHBoxLayout()
+        actions.addWidget(_label('Enter 发送 · Shift/Alt+Enter 换行', 'small'))
+        actions.addStretch()
+        self.cancel_button = _button('停止等待', self.cancel_request)
+        self.send_button = _button('发送', self.send_message, primary=True)
+        self.message_edit.send_requested.connect(self.send_button.click)
+        actions.addWidget(self.cancel_button)
+        actions.addWidget(self.send_button)
+        chat.addLayout(actions)
+        self.status_label = _label('可以提问，或添加文件后发送处理要求。', 'notice', True)
+        self.status_label.setTextFormat(Qt.TextFormat.PlainText)
+        chat.addWidget(self.status_label)
+        self.main_splitter.addWidget(chat_panel)
+
         self.cloud_tabs = QTabWidget()
-        side.addWidget(self.cloud_tabs)
+        self.cloud_tabs.setMinimumWidth(305)
+        self.cloud_tabs.setMaximumWidth(520)
+        self.cloud_tabs.setStyleSheet('QTabWidget::pane {border:1px solid #ECCDDD;border-radius:10px;'
+                                     'background:#FFFCFD;} QTabBar::tab {padding:8px 24px;'
+                                     'border:0;color:#796571;} QTabBar::tab:selected '
+                                     '{background:#F8DAE8;color:#632E49;border-radius:8px;}')
         file_panel = QWidget()
         self.cloud_tabs.addTab(file_panel, '文件')
         side = QVBoxLayout(file_panel)
-        side.setContentsMargins(6, 8, 6, 8)
+        side.setContentsMargins(10, 10, 10, 10)
         attachment_header = QHBoxLayout()
         attachment_header.addWidget(_label('本次文件', 'sectionTitle'))
         attachment_header.addStretch()
         self.attach_button = _button('添加', self.choose_files)
         attachment_header.addWidget(self.attach_button)
         side.addLayout(attachment_header)
-        side.addWidget(_label('可拖入 Excel、PDF、Word 等文件\n每个最多 20 MB，每次会话最多 10 个', 'small', True))
+        side.addWidget(_label('每个最多 20 MB，每次会话最多 10 个\n可直接拖入 Excel、PDF、Word 等文件', 'small', True))
         self.attachment_list = QListWidget()
         self.attachment_list.setMinimumHeight(80)
         side.addWidget(self.attachment_list, 1)
@@ -460,74 +563,84 @@ class FinanceAIPage(QWidget):
         side.addWidget(self.result_list, 1)
         self.download_button = _button('下载选中的文件', self.download_selected)
         side.addWidget(self.download_button)
-        side.addWidget(_label('云端文件约 20 分钟无活动后过期。\n已上传附件可在本次对话中继续使用。', 'small', True))
+        side.addWidget(_label('已上传附件可在本次对话中继续使用。\n生成文件请及时下载。', 'small', True))
+
         cloud_panel = QWidget()
-        self.cloud_tabs.addTab(cloud_panel, '云文档')
         side = QVBoxLayout(cloud_panel)
-        side.setContentsMargins(6, 8, 6, 8)
-        cloud_header = QHBoxLayout()
-        cloud_header.addWidget(_label('云文档处理结果', 'sectionTitle'))
-        cloud_header.addStretch()
-        self.cloud_history_button = _button('历史任务', self.show_cloud_history)
-        cloud_header.addWidget(self.cloud_history_button)
-        side.addLayout(cloud_header)
+        side.setContentsMargins(10, 10, 10, 10)
+        side.setSpacing(8)
+        account_header = QHBoxLayout()
+        account_header.addWidget(_label('WPS 账号', 'sectionTitle'))
+        account_header.addStretch()
+        self.account_connect_button = _button('连接 WPS', self.connect_wps_account)
+        account_header.addWidget(self.account_connect_button)
+        side.addLayout(account_header)
+        self.account_status_label = _label('', 'small', True)
+        self.account_status_label.setTextFormat(Qt.TextFormat.PlainText)
+        side.addWidget(self.account_status_label)
+        side.addWidget(_label('本次使用', 'sectionTitle'))
+        self.cloud_summary = _label('', 'small', True)
+        self.cloud_summary.setTextFormat(Qt.TextFormat.PlainText)
+        side.addWidget(self.cloud_summary)
+        self.current_cloud_list = QListWidget()
+        self.current_cloud_list.setWordWrap(True)
+        self.current_cloud_list.setMinimumHeight(66)
+        self.current_cloud_list.setMaximumHeight(112)
+        self.current_cloud_list.setAccessibleName('本次使用的云文档')
+        side.addWidget(self.current_cloud_list)
+        current_actions = QHBoxLayout()
+        self.open_current_cloud_button = _button('打开文档', self.open_current_cloud)
+        self.remove_current_cloud_button = _button('移出本次', self.remove_current_cloud)
+        current_actions.addWidget(self.open_current_cloud_button)
+        current_actions.addWidget(self.remove_current_cloud_button)
+        side.addLayout(current_actions)
+        self.cloud_mode = QComboBox()
+        self.cloud_mode.addItem('按要求自动处理', False)
+        self.cloud_mode.addItem('只预览，不写入', True)
+        self.cloud_mode.setToolTip('作用于本次使用的云文档。自动模式仅在你明确要求更新时写入。')
+        side.addWidget(self.cloud_mode)
+        side.addWidget(_label('最近使用', 'sectionTitle'))
+        self.recent_cloud_list = QListWidget()
+        self.recent_cloud_list.setMinimumHeight(54)
+        self.recent_cloud_list.setMaximumHeight(110)
+        self.recent_cloud_list.setAccessibleName('最近使用的云文档')
+        side.addWidget(self.recent_cloud_list)
+        self.use_recent_cloud_button = _button('将选中文档用于本次', self.use_recent_cloud)
+        side.addWidget(self.use_recent_cloud_button)
+        history_header = QHBoxLayout()
+        history_header.addWidget(_label('处理记录', 'sectionTitle'))
+        history_header.addStretch()
+        self.cloud_history_button = _button('查看历史', self.show_cloud_history)
+        history_header.addWidget(self.cloud_history_button)
+        side.addLayout(history_header)
         self.cloud_result_list = QListWidget()
         self.cloud_result_list.setWordWrap(True)
-        self.cloud_result_list.setMinimumHeight(70)
+        self.cloud_result_list.setMinimumHeight(85)
+        side.addWidget(self.cloud_result_list, 1)
         cloud_actions = QHBoxLayout()
-        self.open_cloud_button = _button('打开云文档', self.open_cloud_result)
+        self.open_cloud_button = _button('打开文档', self.open_cloud_result)
         self.cloud_details_button = _button('修改明细', self.show_cloud_details)
         cloud_actions.addWidget(self.open_cloud_button)
         cloud_actions.addWidget(self.cloud_details_button)
         side.addLayout(cloud_actions)
-        side.addWidget(self.cloud_result_list, 1)
-        side.addWidget(_label('只更新符合规则的单元格。\n历史任务保存在本机，关闭软件后仍可查看。', 'small', True))
-        side_scroll = QScrollArea()
-        side_scroll.setWidgetResizable(True)
-        side_scroll.setMinimumWidth(250)
-        side_scroll.setWidget(panel)
-        splitter.addWidget(side_scroll)
-        splitter.setStretchFactor(0, 3)
-        splitter.setStretchFactor(1, 1)
-        splitter.setSizes([620, 260])
-        layout.addWidget(splitter, 1)
+        self.cloud_button = _button('旧版连接设置', self.open_cloud_documents)
+        self.cloud_button.setToolTip('兼容之前使用脚本调用地址和令牌连接的文档。')
+        side.addWidget(self.cloud_button)
+        cloud_scroll = QScrollArea()
+        cloud_scroll.setWidgetResizable(True)
+        cloud_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        cloud_scroll.setWidget(cloud_panel)
+        self.cloud_tabs.addTab(cloud_scroll, '云文档')
+        self.main_splitter.addWidget(self.cloud_tabs)
+        self.main_splitter.setStretchFactor(0, 3)
+        self.main_splitter.setStretchFactor(1, 1)
+        self.main_splitter.setSizes([650, 330])
+        layout.addWidget(self.main_splitter, 1)
         self.attachment_list.currentRowChanged.connect(self._sync_controls)
         self.result_list.currentRowChanged.connect(self._sync_controls)
         self.cloud_result_list.currentRowChanged.connect(self._sync_controls)
-        self.question_panel = QFrame()
-        self.question_panel.setObjectName('card')
-        self.question_layout = QVBoxLayout(self.question_panel)
-        self.question_layout.setContentsMargins(10, 8, 10, 8)
-        self.question_scroll = QScrollArea()
-        self.question_scroll.setWidgetResizable(True)
-        self.question_scroll.setMinimumHeight(90)
-        self.question_scroll.setMaximumHeight(220)
-        self.question_scroll.setWidget(self.question_panel)
-        self.question_scroll.hide()
-        layout.addWidget(self.question_scroll)
-        self.message_edit = MessageEdit()
-        self.message_edit.setPlaceholderText('例如：按部门汇总工资表并生成 Excel。\n或粘贴已绑定的 WPS 链接，说明按哪个编号更新哪一列，无需填写行号。')
-        self.message_edit.setMinimumHeight(80)
-        self.message_edit.setMaximumHeight(110)
-        self.message_edit.setStyleSheet('QPlainTextEdit {background:#FFFCFD;border:1px solid #ECCDDD;'
-                                       'border-radius:10px;padding:8px;selection-background-color:#EDBBD1;}')
-        self.message_edit.textChanged.connect(self._sync_controls)
-        layout.addWidget(self.message_edit)
-        actions = QHBoxLayout()
-        self.web_search_checkbox = QCheckBox('联网核实政策和来源')
-        self.web_search_checkbox.setToolTip('开启后允许助手查询公开网页，会增加搜索费用。不要在搜索中填写个人敏感信息。')
-        actions.addWidget(self.web_search_checkbox)
-        actions.addStretch()
-        actions.addWidget(_label('Enter 发送 · Shift/Alt+Enter 换行', 'small'))
-        self.cancel_button = _button('停止等待', self.cancel_request)
-        self.send_button = _button('发送', self.send_message, primary=True)
-        self.message_edit.send_requested.connect(self.send_button.click)
-        actions.addWidget(self.cancel_button)
-        actions.addWidget(self.send_button)
-        layout.addLayout(actions)
-        self.status_label = _label('可以提问，或添加文件后发送处理要求。', 'notice', True)
-        self.status_label.setTextFormat(Qt.TextFormat.PlainText)
-        layout.addWidget(self.status_label)
+        self.current_cloud_list.currentRowChanged.connect(self._sync_controls)
+        self.recent_cloud_list.currentRowChanged.connect(self._sync_controls)
 
     def _status(self, text, error=False):
         self.status_label.setText(self._redact(text))
@@ -543,14 +656,254 @@ class FinanceAIPage(QWidget):
         return value
 
     def _refresh_cloud_summary(self):
-        if self._wps_load_error:
-            text = '云文档配置读取失败'
-        elif self._cloud_links:
-            names = [item.label for item in self.wps_bindings if item.share_url in self._cloud_links]
-            text = '本次云文档：' + '、'.join(names)
+        state = self._account_state()
+        if self._connection_job is not None:
+            account_text = '正在连接，请按浏览器提示完成登录。'
+        elif state.get('connected'):
+            account_text = '已连接' + (' · ' + str(state['display_name']) if state.get('display_name') else '')
+            account_text += '\n每份文档仍按你的编辑权限处理。'
+        elif state.get('status') == 'expired':
+            account_text = '登录已过期，重新连接后可继续。'
+        elif self._account_error:
+            account_text = 'WPS 连接暂不可用，请重新连接。'
         else:
-            text = f'已绑定 {len(self.wps_bindings)} 份 WPS 文档 · 在聊天中粘贴链接使用'
-        self.cloud_summary.setText(text)
+            account_text = '尚未连接。首次使用时完成 WPS 登录即可。'
+        self.account_status_label.setText(account_text)
+        self.account_connect_button.setText('断开连接' if state.get('connected') else '连接 WPS')
+        self.cloud_button.setVisible(any(getattr(item, 'provider', 'airscript') == 'airscript'
+                                        for item in self.wps_bindings))
+        by_url = {normalize_share_url(item.share_url): item for item in self.wps_bindings}
+        previous = self.current_cloud_list.currentRow()
+        self.current_cloud_list.blockSignals(True)
+        self.current_cloud_list.clear()
+        names = []
+        for link in self._selected_cloud_links:
+            binding = by_url.get(link)
+            name = binding.label if binding is not None else '待识别的云文档'
+            names.append(name)
+            if binding is None:
+                status = '发送时连接并识别' if state.get('connected') else '发送时需要登录 WPS'
+            elif getattr(binding, 'provider', 'airscript') == 'skillhub' and not state.get('connected'):
+                status = '需要重新连接 WPS'
+            elif (getattr(binding, 'provider', 'airscript') == 'skillhub'
+                  and getattr(binding, 'account_id', '') != state.get('account_id')):
+                status = '发送时重新核对文档权限'
+            else:
+                status = '已关联 · 处理前检查编辑权限'
+                metadata = getattr(self._cloud_tools, 'document_metadata', {}).get(link, {})
+                if metadata.get('can_edit') is True:
+                    status = '已核实可编辑 · 执行时再次检查'
+                elif metadata.get('can_edit') is False:
+                    status = '当前账号仅可读取，无法更新'
+            snapshots = getattr(self._cloud_tools, 'snapshots', {})
+            sheet_names = []
+            for snapshot in snapshots.values():
+                if snapshot.get('document_url') == link and snapshot.get('sheet') not in sheet_names:
+                    sheet_names.append(snapshot['sheet'])
+            if sheet_names:
+                status += '\n工作表：' + '、'.join(sheet_names)
+            item = QListWidgetItem(name + '\n' + status)
+            item.setData(Qt.ItemDataRole.UserRole, link)
+            item.setToolTip(link)
+            self.current_cloud_list.addItem(item)
+        self.current_cloud_list.setCurrentRow(min(max(previous, 0), len(names) - 1))
+        current_height = sum(max(34, self.current_cloud_list.sizeHintForRow(row))
+                             for row in range(self.current_cloud_list.count()))
+        self.current_cloud_list.setFixedHeight(min(112, max(54, current_height + 8)))
+        self.current_cloud_list.blockSignals(False)
+        self.cloud_summary.setText('仅处理下方选定的文档。' if names else '粘贴链接，或从最近使用中添加。')
+        self.cloud_chip_label.setText('本次云表 · ' + '、'.join(names))
+        self.cloud_chip_label.setToolTip('\n'.join(self._selected_cloud_links))
+        self.cloud_chip.setVisible(bool(names))
+        self.cloud_mode.setVisible(bool(names))
+        previous_recent = self.recent_cloud_list.currentRow()
+        self.recent_cloud_list.blockSignals(True)
+        self.recent_cloud_list.clear()
+        for binding in reversed(self.wps_bindings):
+            item = QListWidgetItem(binding.label)
+            item.setData(Qt.ItemDataRole.UserRole, normalize_share_url(binding.share_url))
+            item.setToolTip(binding.share_url)
+            self.recent_cloud_list.addItem(item)
+        self.recent_cloud_list.setCurrentRow(min(max(previous_recent, 0), self.recent_cloud_list.count() - 1))
+        recent_height = sum(max(22, self.recent_cloud_list.sizeHintForRow(row))
+                            for row in range(self.recent_cloud_list.count()))
+        self.recent_cloud_list.setFixedHeight(min(96, max(34, recent_height + 8)))
+        self.recent_cloud_list.blockSignals(False)
+
+    def _account_state(self):
+        if self.wps_account_service is None:
+            return {'connected': False, 'status': 'disconnected'}
+        try:
+            state = self.wps_account_service.status()
+            return state if isinstance(state, dict) else {'connected': False}
+        except (WpsError, ValueError, OSError):
+            return {'connected': False, 'status': 'expired'}
+
+    def _merge_cloud_bindings(self, bindings):
+        by_url = {normalize_share_url(item.share_url): item for item in self.wps_bindings}
+        for binding in bindings:
+            link = normalize_share_url(binding.share_url)
+            by_url.pop(link, None)
+            by_url[link] = binding
+        self.wps_bindings = list(by_url.values())
+
+    def _message_changed(self):
+        links = extract_share_links(self.message_edit.toPlainText())
+        if links and links != self._selected_cloud_links:
+            self._selected_cloud_links = links
+            self._refresh_cloud_summary()
+            self.cloud_tabs.setCurrentIndex(1)
+        self._sync_controls()
+
+    def add_cloud_link(self):
+        if self.is_busy or self._closed:
+            return
+        dialog = WpsLinkDialog(self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self._select_cloud_link(dialog.value())
+
+    def _select_cloud_link(self, link):
+        link = normalize_share_url(link)
+        if link not in self._selected_cloud_links:
+            self._selected_cloud_links.append(link)
+        self._refresh_cloud_summary()
+        self.cloud_tabs.setCurrentIndex(1)
+        self._sync_controls()
+        self.message_edit.setFocus()
+
+    def use_recent_cloud(self):
+        if self.is_busy or self._closed:
+            return
+        item = self.recent_cloud_list.currentItem()
+        if item is not None:
+            self._select_cloud_link(item.data(Qt.ItemDataRole.UserRole))
+
+    def open_current_cloud(self):
+        item = self.current_cloud_list.currentItem()
+        if not self.is_busy and item is not None:
+            QDesktopServices.openUrl(QUrl(normalize_share_url(item.data(Qt.ItemDataRole.UserRole))))
+
+    def remove_current_cloud(self):
+        item = self.current_cloud_list.currentItem()
+        if self.is_busy or item is None:
+            return
+        link = item.data(Qt.ItemDataRole.UserRole)
+        self._selected_cloud_links = [value for value in self._selected_cloud_links if value != link]
+        # A link left in the draft would otherwise silently re-associate it on Send.
+        pattern = r'https://(?:www\.)?kdocs\.cn/l/[A-Za-z0-9_-]+/?(?:\?[^\s<>]+)?(?:#[^\s<>]+)?'
+        text = re.sub(pattern, lambda match: '' if normalize_share_url(match.group()) == link else match.group(),
+                      self.message_edit.toPlainText())
+        self.message_edit.blockSignals(True)
+        self.message_edit.setPlainText(text)
+        self.message_edit.blockSignals(False)
+        self._cloud_tools = None
+        self._cloud_links = []
+        self._refresh_cloud_summary()
+        self._sync_controls()
+
+    def connect_wps_account(self):
+        if not self.is_busy and not self._closed:
+            if self.wps_account_service is not None and self._account_state().get('connected'):
+                try:
+                    self.wps_account_service.disconnect()
+                except (WpsError, ValueError, OSError) as exc:
+                    self._status('暂时无法断开 WPS 连接：' + str(exc), error=True)
+                    return
+                self._cloud_tools = None
+                self._refresh_cloud_summary()
+                self._sync_controls()
+                self._status('已断开本机 WPS 连接。文档记录仍保留，再次使用时重新登录。')
+                return
+            self._start_cloud_connection([])
+
+    def _start_cloud_connection(self, links, *, resume_message=None):
+        if self.wps_account_service is None:
+            self._status('WPS 账号连接组件暂不可用，请检查软件文件。旧版文档仍可通过连接设置使用。', error=True)
+            return False
+        job = _CloudConnectionJob(self.wps_account_service, links, resume_message=resume_message)
+        self._connection_job = job
+        self._account_error = ''
+        self.cloud_tabs.setCurrentIndex(1)
+        self._refresh_cloud_summary()
+        self._sync_controls()
+        self._status('正在准备 WPS 连接；本次要求和附件已保留，连接后将继续。'
+                     if resume_message is not None else '正在连接 WPS，请按浏览器提示完成登录。')
+        try:
+            job.thread.start()
+        except RuntimeError:
+            self._connection_job = None
+            self._refresh_cloud_summary()
+            self._sync_controls()
+            self._status('无法开始 WPS 连接，请稍后重试。', error=True)
+            return False
+        self._connection_timer.start()
+        return True
+
+    @Slot()
+    def _poll_cloud_connection(self):
+        job = self._connection_job
+        if job is None or self._closed:
+            self._connection_timer.stop()
+            return
+        while not job.events.empty():
+            kind, value = job.events.get()
+            if job.cancel.is_set():
+                continue
+            if kind == 'status':
+                self._status(value)
+            elif kind == 'open_url':
+                url = QUrl(value)
+                if (url.scheme() == 'https' and url.host() == 'mcp-center.wps.cn'
+                        and url.path() == '/kdocs-auth/auth-guide' and not url.userInfo()
+                        and url.port(-1) in (-1, 443)):
+                    if not QDesktopServices.openUrl(url):
+                        job.launch_error = '无法打开 WPS 登录页，请检查默认浏览器后重试。'
+                        job.cancel.set()
+                        self._status(job.launch_error, error=True)
+                else:
+                    job.launch_error = 'WPS 登录地址无效，已停止连接。'
+                    job.cancel.set()
+                    self._status(job.launch_error, error=True)
+        if job.thread.is_alive():
+            return
+        self._connection_timer.stop()
+        self._connection_job = None
+        cancelled = (job.cancel.is_set() or isinstance(job.error, RequestCancelled)
+                     or getattr(job.error, 'code', None) == 'CANCELLED')
+        if not cancelled and job.error is None:
+            try:
+                found = {normalize_share_url(item.share_url) for item in (job.result or [])}
+                if any(link not in found for link in job.links):
+                    raise WpsError('没有识别到全部目标文档，请检查链接和编辑权限。')
+                self._merge_cloud_bindings(job.result or [])
+                state = self._account_state()
+                if job.links and any(getattr(item, 'provider', 'airscript') == 'skillhub' and (
+                        not state.get('connected') or item.account_id != state.get('account_id'))
+                        for item in job.result or []):
+                    raise WpsError('WPS 登录状态已变化，请重新连接后再发送。')
+                self._wps_load_error = ''
+                self._account_error = ''
+                self._cloud_tools = None
+            except (WpsError, ValueError, OSError) as exc:
+                job.error = exc
+        if not cancelled and job.error is not None:
+            self._account_error = str(job.error)
+        self._refresh_cloud_summary()
+        self._sync_controls()
+        if job.launch_error:
+            self._status(job.launch_error + '\n本次要求和附件已保留。', error=True)
+        elif cancelled:
+            self._status('已停止 WPS 连接。本次要求和附件已保留。')
+        elif job.error is not None:
+            self._status('WPS 连接未完成：' + str(job.error) + '\n本次要求和附件已保留。', error=True)
+        elif job.resume_message is not None:
+            # The editor and attachment controls stayed locked throughout login.
+            if self.message_edit.toPlainText().strip() == job.resume_message:
+                self.send_message()
+            else:
+                self._status('WPS 已连接。本次要求已变化，请检查后发送。')
+        else:
+            self._status('WPS 已连接。粘贴云文档链接并说明处理要求即可。')
 
     def _refresh_usage(self):
         try:
@@ -577,17 +930,23 @@ class FinanceAIPage(QWidget):
         busy = self.is_busy or self._closed
         for control in (self.message_edit, self.settings_button, self.new_chat_button,
                         self.attach_button, self.web_search_checkbox, self.rules_button,
-                        self.cloud_button, self.cloud_mode, self.cloud_history_button):
+                        self.cloud_button, self.cloud_mode, self.cloud_history_button,
+                        self.input_attach_button, self.add_cloud_button, self.account_connect_button):
             control.setEnabled(not busy)
         self.test_button.setEnabled(not busy and bool(self.settings.api_key))
         self.send_button.setEnabled(not busy and bool(self.message_edit.toPlainText().strip()))
-        self.cancel_button.setEnabled(self.is_busy and not self._job.cancel.is_set())
+        active_job = self._job or self._connection_job
+        self.cancel_button.setEnabled(active_job is not None and not active_job.cancel.is_set())
         row = self.attachment_list.currentRow()
         self.remove_button.setEnabled(not busy and 0 <= row < len(self.pending_paths))
         self.download_button.setEnabled(not busy and self.result_list.currentRow() >= 0)
         selected = 0 <= self.cloud_result_list.currentRow() < len(self.cloud_results)
         self.open_cloud_button.setEnabled(not busy and selected)
         self.cloud_details_button.setEnabled(not busy and selected)
+        selected_current = self.current_cloud_list.currentItem() is not None
+        self.open_current_cloud_button.setEnabled(not busy and selected_current)
+        self.remove_current_cloud_button.setEnabled(not busy and selected_current)
+        self.use_recent_cloud_button.setEnabled(not busy and self.recent_cloud_list.currentItem() is not None)
         for button in self._clarification_buttons:
             button.setEnabled(not busy)
 
@@ -696,9 +1055,8 @@ class FinanceAIPage(QWidget):
             self.client = self.client_factory(self.settings)
         return self.client
 
-    def _cloud_context_for(self, message, history):
-        if any(binding.token and binding.token in message for binding in self.wps_bindings):
-            raise ValueError('请不要把脚本令牌写在聊天里；令牌仅需填写在“云文档”连接设置中。')
+    def _requested_cloud_links(self, message):
+        """Resolve history before login, so a recheck can resume after reconnecting."""
         links = extract_share_links(message)
         historical_check = False
         # A task number alone does not authorize reading local history. Resolve
@@ -721,6 +1079,14 @@ class FinanceAIPage(QWidget):
             except (WpsError, ValueError, OSError, TypeError):
                 raise ValueError('找不到这条有效的本机任务记录。请核对任务编号，或在“历史任务”中选择要检查的任务。') from None
             historical_check = True
+        if not links:
+            links = list(self._selected_cloud_links)
+        return links, historical_check
+
+    def _cloud_context_for(self, message, history):
+        if any(binding.token and binding.token in message for binding in self.wps_bindings):
+            raise ValueError('请不要把脚本令牌写在聊天里；令牌仅需填写在“云文档”连接设置中。')
+        links, historical_check = self._requested_cloud_links(message)
         if links:
             if self._wps_load_error:
                 raise ValueError('云文档配置读取失败，请先打开“云文档”检查。')
@@ -730,12 +1096,16 @@ class FinanceAIPage(QWidget):
                 raise ValueError('这次链接中有尚未绑定的 WPS 文档。请先打开“云文档”添加并只读测试，再发送这条要求。')
             if links != self._cloud_links or self._cloud_tools is None or historical_check:
                 factory = self.cloud_tools_factory
+                options = {'allow_write': False, 'journal_dir': self.cloud_journal_dir}
                 if factory is None:
                     from .cloud_tools import CloudDocumentTools
+                    from .wps_adapter import create_wps_client
                     factory = CloudDocumentTools
-                self._cloud_tools = factory([by_url[link] for link in links], allow_write=False,
-                                            journal_dir=self.cloud_journal_dir)
+                    options['client_factory'] = partial(create_wps_client,
+                        account_path=getattr(self.wps_account_service, 'path', None))
+                self._cloud_tools = factory([by_url[link] for link in links], **options)
                 self._cloud_links = list(links)
+                self._selected_cloud_links = list(links)
                 self._refresh_cloud_summary()
         if self._cloud_tools is not None:
             self._cloud_tools.begin_turn(message, history=history,
@@ -770,7 +1140,22 @@ class FinanceAIPage(QWidget):
         try:
             validate_settings(self.settings)
             self.ledger.check_budget(self.settings.monthly_limit_usd)
+            if any(binding.token and binding.token in message for binding in self.wps_bindings):
+                raise ValueError('请不要把脚本令牌写在聊天里；令牌仅需填写在“云文档”连接设置中。')
+            links, _ = self._requested_cloud_links(message)
+            if links and self.wps_account_service is not None and not self._wps_load_error:
+                by_url = {normalize_share_url(item.share_url): item for item in self.wps_bindings}
+                state = self._account_state()
+                unresolved = [link for link in links if link not in by_url or (
+                    getattr(by_url[link], 'provider', 'airscript') == 'skillhub' and (
+                        not state.get('connected') or by_url[link].account_id != state.get('account_id')))]
+                if unresolved:
+                    self._start_cloud_connection(unresolved, resume_message=message)
+                    return
+            previous_links = list(self._cloud_links)
             cloud_tools = self._cloud_context_for(message, self.history[-20:])
+            if self._cloud_links and self._cloud_links != previous_links and not extract_share_links(message):
+                message += '\n本次云文档：\n' + '\n'.join(self._cloud_links)
             client = self._get_client()
         except (AIError, WpsError, ValueError, OSError) as exc:
             self._status(exc, error=True)
@@ -827,6 +1212,11 @@ class FinanceAIPage(QWidget):
         self._start_job('test', lambda job: client.test_connection())
 
     def cancel_request(self):
+        if self._connection_job is not None:
+            self._connection_job.cancel.set()
+            self._status('正在停止 WPS 连接；本次要求和附件会保留。')
+            self._sync_controls()
+            return
         if self._job:
             self._job.cancel.set()
             self._status('正在停止后续操作；已提交的云端请求仍可能完成。云文档结果请查看任务记录。'
@@ -934,6 +1324,7 @@ class FinanceAIPage(QWidget):
     def _job_finished(self, job_id):
         if self._current_job(job_id):
             self._job = None
+            self._refresh_cloud_summary()
             self._sync_controls()
 
     def open_rules(self):
@@ -959,6 +1350,7 @@ class FinanceAIPage(QWidget):
             self._cloud_tools = None
             self._cloud_links = []
             self._refresh_cloud_summary()
+            self._sync_controls()
             self._status('云文档连接已更新。请在聊天里粘贴目标链接并说明处理要求。')
 
     def _clear_cloud_questions(self):
@@ -1261,8 +1653,7 @@ class FinanceAIPage(QWidget):
         self.generated_files.clear()
         self._cloud_tools = None
         self._cloud_links.clear()
-        self.cloud_results.clear()
-        self.cloud_result_list.clear()
+        self._selected_cloud_links.clear()
         self._clear_cloud_questions()
         self._refresh_cloud_summary()
         self.history.clear()
@@ -1307,6 +1698,9 @@ class FinanceAIPage(QWidget):
         if self._closed:
             return
         self._closed = True
+        self._connection_timer.stop()
+        if self._connection_job is not None:
+            self._connection_job.cancel.set()
         if self._job:
             self._job.abandon = True
             self._job.cancel.set()

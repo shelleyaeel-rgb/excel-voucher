@@ -52,9 +52,12 @@ class WpsBinding:
     id: str
     label: str
     share_url: str
-    endpoint: str
-    token: str = field(repr=False)
+    endpoint: str = ""
+    token: str = field(default="", repr=False)
     workbook_name: str = ""
+    provider: str = "airscript"
+    account_id: str = ""
+    file_id: str = ""
 
 
 def normalize_share_url(url: str) -> str:
@@ -98,12 +101,31 @@ def validate_binding(binding: WpsBinding) -> None:
             or not binding.label.strip() or len(binding.label) > 200):
         raise WpsError("云文档名称或编号无效，请重新添加。", code="INVALID_BINDING")
     normalize_share_url(binding.share_url)
-    _endpoint(binding.endpoint)
-    if (not isinstance(binding.token, str) or not binding.token or len(binding.token) > 8192
-            or any(ord(c) < 33 or ord(c) > 126 for c in binding.token)):
-        raise WpsError("脚本令牌不能为空，也不能含空格、换行或非英文字符。", code="INVALID_TOKEN")
     if not isinstance(binding.workbook_name, str) or len(binding.workbook_name) > 512:
         raise WpsError("云文档校验名称无效，请重新连接。", code="INVALID_BINDING")
+    if binding.provider == "airscript":
+        _endpoint(binding.endpoint)
+        if (not isinstance(binding.token, str) or not binding.token or len(binding.token) > 8192
+                or any(ord(c) < 33 or ord(c) > 126 for c in binding.token)):
+            raise WpsError("脚本令牌不能为空，也不能含空格、换行或非英文字符。", code="INVALID_TOKEN")
+        routed_file = urllib.parse.urlsplit(binding.endpoint).path.split("/")[5]
+        if binding.account_id != "" or binding.file_id not in ("", routed_file):
+            raise WpsError("共享脚本文档身份不一致，请重新连接。", code="INVALID_BINDING")
+    elif binding.provider == "skillhub":
+        if (binding.endpoint != "" or binding.token != ""
+                or not isinstance(binding.account_id, str) or not _ID.fullmatch(binding.account_id)
+                or not isinstance(binding.file_id, str) or not _ID.fullmatch(binding.file_id)):
+            raise WpsError("账号文档连接信息不完整，请重新连接；账号令牌不能保存到文档配置。", code="INVALID_BINDING")
+    else:
+        raise WpsError("云文档连接方式无法识别，请重新连接。", code="INVALID_BINDING")
+
+
+def binding_identity(binding: WpsBinding) -> dict:
+    """Stable route identity, never a sharing alias, label, or credential."""
+    validate_binding(binding)
+    file_id = (urllib.parse.urlsplit(binding.endpoint).path.split("/")[5]
+               if binding.provider == "airscript" else binding.file_id)
+    return {"provider": binding.provider, "account_id": binding.account_id, "file_id": file_id}
 
 
 def _validate_collection(bindings: list[WpsBinding]) -> None:
@@ -126,15 +148,29 @@ def load_bindings(path: Path | None = None) -> list[WpsBinding]:
             if target.stat().st_size > 2 * 1024 * 1024:
                 raise ValueError("oversized")
             body = json.loads(target.read_text(encoding="utf-8"))
-            if not isinstance(body, dict) or body.get("version") != 1 or not isinstance(body.get("documents"), list):
+            if (not isinstance(body, dict) or type(body.get("version")) is not int
+                    or body["version"] not in (1, 2) or not isinstance(body.get("documents"), list)):
                 raise ValueError("schema")
             bindings = []
             for item in body["documents"]:
-                if not isinstance(item, dict) or "token" in item or not isinstance(item.get("token_protected"), str):
+                if not isinstance(item, dict) or any(k in item for k in ("token", "access_token", "refresh_token")):
                     raise ValueError("credential schema")
+                provider = item.get("provider", "airscript") if body["version"] == 1 else item.get("provider")
+                if body["version"] == 1 and provider != "airscript":
+                    raise ValueError("provider schema")
+                if provider == "airscript":
+                    if not isinstance(item.get("token_protected"), str):
+                        raise ValueError("credential schema")
+                    token, endpoint = _decrypt_key(item["token_protected"]), item["endpoint"]
+                elif provider == "skillhub":
+                    if "token_protected" in item or item.get("endpoint", "") != "":
+                        raise ValueError("credential schema")
+                    token, endpoint = "", ""
+                else:
+                    raise ValueError("provider schema")
                 bindings.append(WpsBinding(id=item["id"], label=item["label"], share_url=item["share_url"],
-                                           endpoint=item["endpoint"], token=_decrypt_key(item["token_protected"]),
-                                           workbook_name=item.get("workbook_name", "")))
+                                           endpoint=endpoint, token=token, workbook_name=item.get("workbook_name", ""),
+                                           provider=provider, account_id=item.get("account_id", ""), file_id=item.get("file_id", "")))
             _validate_collection(bindings)
             return bindings
         except FileNotFoundError:
@@ -148,10 +184,15 @@ def save_bindings(bindings: list[WpsBinding], path: Path | None = None) -> None:
     target = Path(path) if path is not None else data_dir() / "wps_documents.json"
     with _LOCK:
         try:
-            documents = [dict(id=b.id, label=b.label, share_url=normalize_share_url(b.share_url),
-                              endpoint=b.endpoint, token_protected=_encrypt_key(b.token),
-                              workbook_name=b.workbook_name) for b in bindings]
-            _atomic_write(target, {"version": 1, "documents": documents})
+            documents = []
+            for b in bindings:
+                item = dict(id=b.id, label=b.label, share_url=normalize_share_url(b.share_url),
+                            workbook_name=b.workbook_name, provider=b.provider,
+                            account_id=b.account_id, file_id=b.file_id)
+                if b.provider == "airscript":
+                    item.update(endpoint=b.endpoint, token_protected=_encrypt_key(b.token))
+                documents.append(item)
+            _atomic_write(target, {"version": 2, "documents": documents})
         except (OSError, ValueError, TypeError):
             raise WpsError("无法安全保存云文档配置；请检查当前 Windows 账户和保存目录。", code="CONFIG_SAVE_FAILED") from None
 
@@ -227,6 +268,8 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 class WpsClient:
     def __init__(self, binding: WpsBinding, opener=None):
         validate_binding(binding)
+        if binding.provider != "airscript":
+            raise WpsError("此文档使用 WPS 账号连接，不能通过共享脚本调用。", code="INVALID_BINDING")
         self.binding = replace(binding)
         self.endpoint_file_id = urllib.parse.urlsplit(binding.endpoint).path.split("/")[5]
         self.opener = opener if opener is not None else urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())

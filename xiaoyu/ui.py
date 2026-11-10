@@ -1440,7 +1440,11 @@ class MainWindow(QMainWindow):
             return
         if (self.update_controller.has_ready_update and self.ai_page is not None
                 and self.ai_page.is_busy):
-            self._notify("AI 助手正在处理，请等当前操作结束后再更新。")
+            message = "AI 助手正在处理，请等当前操作结束后再更新。"
+            self._notify(message)
+            status = getattr(self.ai_page, "_status", None)
+            if callable(status):
+                status(message)
             event.ignore()
             return
         self._save_timer.stop()

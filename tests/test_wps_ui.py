@@ -13,12 +13,13 @@ os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
 import pytest
 from PySide6.QtCore import QCoreApplication, QEvent, QObject
 from PySide6.QtWidgets import QApplication, QDialog, QLineEdit
+from PySide6.QtGui import QCloseEvent
 from shiboken6 import isValid
 
 from xiaoyu import ai_ui, wps_ui
-from xiaoyu.ai_service import AIError, AIResult
+from xiaoyu.ai_service import AIError, AIResult, RequestCancelled, UploadedFile
 from xiaoyu.ai_settings import AISettings, UsageLedger
-from xiaoyu.wps_service import WpsBinding
+from xiaoyu.wps_service import WpsBinding, WpsError
 
 
 URL = 'https://www.kdocs.cn/l/doc-test'
@@ -227,10 +228,19 @@ class AIClient:
         self.error = None
         self.result = AIResult('已核对。')
         self.questions = []
+        self.uploads = []
         self.instances.append(self)
+
+    def upload_file(self, path, cancel=None):
+        self.uploads.append(Path(path))
+        return UploadedFile('file-test', Path(path).name, Path(path).stat().st_size)
+
+    def delete_file(self, file_id):
+        pass
 
     def send(self, message, files, history, **kwargs):
         self.calls.append((message, kwargs))
+        self.sent_files = list(files)
         if kwargs.get('cloud_tools') is not None:
             kwargs['cloud_tools'].questions = list(self.questions)
         if self.error:
@@ -244,18 +254,20 @@ def page_factory(app, tmp_path, monkeypatch):
     AIClient.instances, CloudTools.instances = [], []
     monkeypatch.setattr(ai_ui, 'load_bindings', lambda path: [binding()])
 
-    def create():
+    def create(**kwargs):
+        kwargs.setdefault('wps_account_service', False)
         page = ai_ui.FinanceAIPage(settings=AISettings(api_key='fake-openai-key'),
                                   settings_path=tmp_path / 'settings.json', rules_path=tmp_path / 'rules.json',
                                   ledger=UsageLedger(tmp_path / 'usage.json'), client_factory=AIClient,
-                                  cloud_tools_factory=CloudTools, cloud_journal_dir=tmp_path / 'tasks')
+                                  cloud_tools_factory=CloudTools, cloud_journal_dir=tmp_path / 'tasks', **kwargs)
         pages.append(page)
         return page
 
     yield create
     for page in pages:
-        page.shutdown()
-        dispose(app, page)
+        if isValid(page):
+            page.shutdown()
+            dispose(app, page)
 
 
 def send(page, app, message):
@@ -500,3 +512,328 @@ def test_history_reload_preserves_current_check_state(page_factory):
     page.show_cloud_history()
     assert '当前有 1 项不同/无法定位' in page.cloud_result_list.item(0).text()
     assert page.cloud_results[0]['current_check']['changed'] == 1
+
+
+NEW_URL = 'https://www.kdocs.cn/l/first-account-document'
+ACCOUNT_ID = '1731a7bb-22ac-4819-8833-20aa36c1c456'
+
+
+class AccountService:
+    """An explicit browser-login boundary; no credentials or real WPS calls."""
+    def __init__(self, connected=False):
+        self.connected = connected
+        self.documents = []
+        self.connect_calls = 0
+        self.resolve_calls = []
+        self.release = threading.Event()
+        self.entered = threading.Event()
+        self.auth_url = 'https://mcp-center.wps.cn/kdocs-auth/auth-guide?auth_code=' + ACCOUNT_ID
+
+    def status(self):
+        return {'connected': self.connected, 'account_id': ACCOUNT_ID if self.connected else '',
+                'display_name': 'WPS 个人账号'}
+
+    def list_documents(self):
+        return list(self.documents)
+
+    def disconnect(self):
+        self.connected = False
+
+    def connect(self, *, cancel, on_status, open_url):
+        self.connect_calls += 1
+        self.entered.set()
+        open_url(self.auth_url)
+        on_status('请完成 WPS 登录')
+        while not self.release.wait(.005):
+            if cancel.is_set():
+                raise RequestCancelled()
+        if cancel.is_set():
+            raise RequestCancelled()
+        self.connected = True
+
+    def resolve_documents(self, links, *, cancel, on_status):
+        self.resolve_calls.append(list(links))
+        self.documents = [WpsBinding('personal-document', '个人收款表', link,
+                                    workbook_name='收款表.xlsx', provider='skillhub',
+                                    account_id=ACCOUNT_ID, file_id='123456') for link in links]
+        return list(self.documents)
+
+
+def test_first_login_resumes_same_request_attachment_and_preview(page_factory, app, tmp_path, monkeypatch):
+    service = AccountService()
+    opened = []
+    monkeypatch.setattr(ai_ui.QDesktopServices, 'openUrl', lambda url: opened.append(url.toString()) or True)
+    page = page_factory(wps_account_service=service)
+    source = tmp_path / '来源.csv'
+    source.write_text('单号,金额\n0001,0\n', encoding='utf-8')
+    page.add_paths([source])
+    page.cloud_mode.setCurrentIndex(1)
+    message = '按单号匹配，更新金额 ' + NEW_URL
+    page.message_edit.setPlainText(message)
+    page.send_message()
+    try:
+        pump(app, lambda: bool(opened))
+        assert page.is_busy and not page.message_edit.isEnabled()
+        assert not page.input_attach_button.isEnabled() and not page.add_cloud_button.isEnabled()
+        assert page.pending_paths == [source] and not AIClient.instances
+        assert '发送时需要登录' in page.current_cloud_list.item(0).text()
+        service.release.set()
+        pump(app, lambda: not page.is_busy)
+        assert service.connect_calls == 1 and service.resolve_calls == [[NEW_URL]]
+        assert page.client.uploads == [source]
+        assert len(page.client.calls) == 1 and page.client.calls[0][0] == message
+        assert page.client.sent_files[0].file_id == 'file-test'
+        assert page._cloud_tools.turns[0][2] is True
+        assert page._selected_cloud_links == [NEW_URL] and not page.cloud_chip.isHidden()
+        assert '已连接' in page.account_status_label.text()
+        assert '处理前检查编辑权限' in page.current_cloud_list.item(0).text()
+    finally:
+        service.release.set()
+
+
+def test_cancel_login_retains_request_and_files_then_retry_resumes(page_factory, app, tmp_path, monkeypatch):
+    service = AccountService()
+    monkeypatch.setattr(ai_ui.QDesktopServices, 'openUrl', lambda url: True)
+    page = page_factory(wps_account_service=service)
+    source = tmp_path / 'source.csv'
+    source.write_text('key,value\n001,9\n', encoding='utf-8')
+    page.add_paths([source])
+    message = '更新到账金额 ' + NEW_URL
+    page.message_edit.setPlainText(message)
+    page.send_message()
+    pump(app, service.entered.is_set)
+    page.cancel_request()
+    pump(app, lambda: not page.is_busy)
+    assert page.pending_paths == [source] and page.message_edit.toPlainText() == message
+    assert not AIClient.instances and not service.resolve_calls
+    assert '要求和附件已保留' in page.status_label.text()
+    service.release.set()
+    page.send_message()
+    pump(app, lambda: not page.is_busy)
+    assert service.connect_calls == 2 and len(page.client.calls) == 1
+    assert page.client.uploads == [source]
+
+
+def test_recent_selection_never_executes_and_new_chat_keeps_records(page_factory):
+    service = AccountService(connected=True)
+    service.resolve_documents([NEW_URL], cancel=threading.Event(), on_status=lambda value: None)
+    page = page_factory(wps_account_service=service)
+    page.recent_cloud_list.setCurrentRow(0)
+    page.use_recent_cloud()
+    assert page._selected_cloud_links == [NEW_URL] and not AIClient.instances
+    assert service.connect_calls == 0 and service.resolve_calls == [[NEW_URL]]
+    page._record_cloud_results([{'task_id': 'task-one', 'document_url': NEW_URL,
+                                'document_name': '收款表', 'status': 'prepared'}])
+    recent_count = page.recent_cloud_list.count()
+    page.new_chat()
+    assert not page._selected_cloud_links and page.current_cloud_list.count() == 0
+    assert page.cloud_chip.isHidden() and page.recent_cloud_list.count() == recent_count
+    assert page.cloud_result_list.count() == 1 and page.cloud_results[0]['task_id'] == 'task-one'
+    assert not AIClient.instances
+
+
+def test_new_link_reuses_connected_account_and_shows_real_sheet_permission(page_factory, app):
+    service = AccountService(connected=True)
+    page = page_factory(wps_account_service=service)
+    send(page, app, '先预览 ' + NEW_URL)
+    assert service.connect_calls == 0 and service.resolve_calls == [[NEW_URL]]
+    page._cloud_tools.document_metadata = {NEW_URL: {'can_edit': False, 'sheets': ['汇总']}}
+    page._cloud_tools.snapshots = {'snapshot': {'document_url': NEW_URL, 'sheet': '汇总'}}
+    page._refresh_cloud_summary()
+    text = page.current_cloud_list.item(0).text()
+    assert '当前账号仅可读取' in text and '工作表：汇总' in text
+    assert '已连接' in page.account_status_label.text()
+
+
+def test_historical_recheck_reconnects_before_ai_and_keeps_preview(page_factory, app, monkeypatch):
+    service = AccountService()
+    service.release.set()
+    monkeypatch.setattr(ai_ui.QDesktopServices, 'openUrl', lambda url: True)
+    page = page_factory(wps_account_service=service)
+    task_id = 'b9' * 16
+    page.cloud_journal_dir.mkdir()
+    record = {'schema': 1, 'task_id': task_id, 'document_url': NEW_URL, 'status': 'uncertain'}
+    (page.cloud_journal_dir / (task_id + '.json')).write_text(json.dumps(record), encoding='utf-8')
+    send(page, app, '核对任务 ' + task_id)
+    assert service.connect_calls == 1 and service.resolve_calls == [[NEW_URL]]
+    assert len(page.client.calls) == 1 and page._cloud_tools.turns[0][2] is True
+    assert page._cloud_tools.allow_write is False
+
+
+def test_login_browser_failure_preserves_helpful_error_and_draft(page_factory, app, monkeypatch):
+    service = AccountService()
+    monkeypatch.setattr(ai_ui.QDesktopServices, 'openUrl', lambda url: False)
+    page = page_factory(wps_account_service=service)
+    send(page, app, '更新 ' + NEW_URL)
+    assert '无法打开 WPS 登录页' in page.status_label.text()
+    assert page.message_edit.toPlainText() == '更新 ' + NEW_URL
+    assert not AIClient.instances and not service.resolve_calls
+
+
+def test_connection_worker_survives_parent_teardown_without_qt_calls(page_factory, app, monkeypatch):
+    service = AccountService()
+    monkeypatch.setattr(ai_ui.QDesktopServices, 'openUrl', lambda url: True)
+    page = page_factory(wps_account_service=service)
+    page.message_edit.setPlainText('更新 ' + NEW_URL)
+    page.send_message()
+    pump(app, service.entered.is_set)
+    worker = page._connection_job
+    assert not isinstance(worker, QObject)
+    page.shutdown()
+    worker.thread.join(timeout=3)
+    assert not worker.thread.is_alive() and worker.cancel.is_set()
+    assert not service.resolve_calls and not AIClient.instances
+
+
+def test_legacy_dialog_preserves_account_documents(app, tmp_path, monkeypatch):
+    service = AccountService(connected=True)
+    personal = service.resolve_documents([NEW_URL], cancel=threading.Event(), on_status=lambda value: None)[0]
+    saved = []
+    monkeypatch.setattr(wps_ui, 'save_bindings', lambda values, path: saved.append(list(values)))
+    dialog = wps_ui.WpsDocumentsDialog([personal, binding()], tmp_path / 'wps.json', client_factory=ProbeClient)
+    try:
+        assert dialog.list.count() == 1 and dialog.share_edit.text() == URL
+        dialog.delete_binding()
+        assert saved == [[personal]] and dialog.bindings == [personal]
+    finally:
+        dispose(app, dialog)
+
+
+def test_recent_document_from_previous_login_is_rebound_before_send(page_factory, app):
+    service = AccountService(connected=True)
+    service.documents = [WpsBinding('old-personal', '旧连接的收款表', NEW_URL,
+                                   workbook_name='收款表.xlsx', provider='skillhub',
+                                   account_id='previous-login', file_id='123456')]
+    page = page_factory(wps_account_service=service)
+    page.recent_cloud_list.setCurrentRow(0)
+    page.use_recent_cloud()
+    assert '重新核对文档权限' in page.current_cloud_list.item(0).text()
+    assert not AIClient.instances and not service.resolve_calls
+    send(page, app, '更新到账金额')
+    assert service.connect_calls == 0 and service.resolve_calls == [[NEW_URL]]
+    assert page._cloud_tools.bindings[0].account_id == ACCOUNT_ID
+    assert page.client.calls[0][0] == '更新到账金额\n本次云文档：\n' + NEW_URL
+    previous_tools = page._cloud_tools
+    page.connect_wps_account()
+    assert page._cloud_tools is None and not service.connected
+    assert previous_tools is not page._cloud_tools
+
+
+def test_remove_current_document_removes_pasted_link_and_stale_write_scope(page_factory, app):
+    page = page_factory()
+    send(page, app, '更新到账金额 ' + URL)
+    page.message_edit.setPlainText('这次再核对 ' + URL + '。')
+    page.remove_current_cloud()
+    assert not page._selected_cloud_links and page._cloud_tools is None
+    assert URL not in page.message_edit.toPlainText() and page.cloud_chip.isHidden()
+    page.send_message()
+    pump(app, lambda: not page.is_busy)
+    assert 'cloud_tools' not in page.client.calls[-1][1]
+
+
+def test_login_success_then_access_denied_retains_request_and_attachment(page_factory, app, tmp_path, monkeypatch):
+    service = AccountService()
+    service.release.set()
+    original_resolve = service.resolve_documents
+    monkeypatch.setattr(ai_ui.QDesktopServices, 'openUrl', lambda url: True)
+
+    def denied(*args, **kwargs):
+        raise WpsError('当前账号没有访问这份文档的权限。', code='ACCESS_DENIED')
+
+    service.resolve_documents = denied
+    page = page_factory(wps_account_service=service)
+    source = tmp_path / 'source.csv'
+    source.write_text('key,value\n001,9\n', encoding='utf-8')
+    page.add_paths([source])
+    message = '按单号更新金额 ' + NEW_URL
+    send(page, app, message)
+    assert service.connected and service.connect_calls == 1
+    assert page.pending_paths == [source] and page.message_edit.toPlainText() == message
+    assert not AIClient.instances and '没有访问' in page.status_label.text()
+    assert '已连接' in page.account_status_label.text()
+    service.resolve_documents = original_resolve
+    page.send_message()
+    pump(app, lambda: not page.is_busy)
+    assert service.connect_calls == 1 and len(page.client.calls) == 1
+    assert page.client.uploads == [source]
+
+
+def test_expired_account_is_shown_after_request_and_keeps_retry_enabled(page_factory, app, tmp_path, monkeypatch):
+    from xiaoyu.wps_skillhub import WpsAccount, WpsAccountService, save_account, mark_account_expired
+
+    account_path = tmp_path / 'account-scope' / 'wps_account.json'
+    account_path.parent.mkdir()
+    save_account(WpsAccount(ACCOUNT_ID, 'fake-account-token'), account_path)
+    service = WpsAccountService(path=account_path, documents_path=tmp_path / 'wps.json')
+    page = page_factory(wps_account_service=service)
+    page.wps_bindings = [WpsBinding('personal', '收款表', NEW_URL, workbook_name='收款表.xlsx',
+                                   provider='skillhub', account_id=ACCOUNT_ID, file_id='123456')]
+
+    def expired(*args, **kwargs):
+        mark_account_expired(ACCOUNT_ID, account_path)
+        raise AIError('WPS 授权已失效，请重新连接。')
+
+    monkeypatch.setattr(page._get_client(), 'send', expired)
+    send(page, app, '更新金额 ' + NEW_URL)
+    assert '登录已过期' in page.account_status_label.text()
+    assert page.account_connect_button.text() == '连接 WPS' and page.account_connect_button.isEnabled()
+    assert page.message_edit.toPlainText() == '更新金额 ' + NEW_URL
+    assert page.send_button.isEnabled() and '需要重新连接' in page.current_cloud_list.item(0).text()
+
+
+def test_default_cloud_tools_uses_same_account_store_as_ui(page_factory, tmp_path, monkeypatch):
+    from xiaoyu import wps_adapter
+
+    service = AccountService(connected=True)
+    service.path = tmp_path / 'isolated-account.json'
+    service.documents_path = tmp_path / 'isolated-documents.json'
+    service.resolve_documents([NEW_URL], cancel=threading.Event(), on_status=lambda value: None)
+    page = page_factory(wps_account_service=service)
+    page.cloud_tools_factory = None
+    received = []
+    monkeypatch.setattr(wps_adapter, 'create_wps_client',
+                        lambda binding, **kwargs: received.append((binding, kwargs)))
+    tools = page._cloud_context_for('只读取 ' + NEW_URL, [])
+    tools.client_factory(next(iter(tools.bindings.values())))
+    assert page.wps_path == service.documents_path
+    assert received[0][1] == {'account_path': service.path}
+
+
+def test_main_window_blocks_update_during_login_and_normal_close_cancels(page_factory, app, tmp_path, monkeypatch):
+    from xiaoyu import ui
+    from xiaoyu.material_store import MaterialStore
+
+    service = AccountService()
+    monkeypatch.setattr(ai_ui.QDesktopServices, 'openUrl', lambda url: True)
+    page = page_factory(wps_account_service=service)
+    monkeypatch.setattr(ui, 'load_config', lambda: {})
+    monkeypatch.setattr(ui, 'save_config', lambda value: None)
+    monkeypatch.setattr(ai_ui, 'FinanceAIPage', lambda: page)
+    window = ui.MainWindow(material_store=MaterialStore(tmp_path / 'materials.sqlite3'))
+    window._navigate(4)
+    monkeypatch.setattr(window, '_save_settings', lambda: True)
+    try:
+        page.message_edit.setPlainText('更新 ' + NEW_URL)
+        page.send_message()
+        pump(app, service.entered.is_set)
+        worker = page._connection_job
+        window.update_controller.candidate_dir = tmp_path / 'ready'
+        window.update_controller.release = {'version': '1.0.0'}
+        update_close = QCloseEvent()
+        window.closeEvent(update_close)
+        assert not update_close.isAccepted() and not worker.cancel.is_set()
+        assert '当前操作结束后再更新' in window.notice.text()
+        assert '当前操作结束后再更新' in page.status_label.text()
+        window.update_controller.candidate_dir = None
+        window.update_controller.release = None
+        normal_close = QCloseEvent()
+        window.closeEvent(normal_close)
+        assert normal_close.isAccepted() and page._closed and worker.cancel.is_set()
+        worker.thread.join(timeout=3)
+        assert not worker.thread.is_alive() and not service.resolve_calls
+    finally:
+        page.shutdown()
+        service.release.set()
+        window.update_controller.candidate_dir = None
+        window.update_controller.release = None
+        dispose(app, window)

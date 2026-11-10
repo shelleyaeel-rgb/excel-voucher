@@ -4,12 +4,15 @@ from __future__ import annotations
 from copy import deepcopy
 from pathlib import Path
 import tempfile
+import uuid
 
 
 def run_wps_smoke():
     from .cloud_tools import CloudDocumentTools
     from .config import resource_path
     from .wps_service import WpsBinding, load_bindings, save_bindings
+    from .wps_skillhub import WpsAccount, save_account, require_account
+    from .wps_adapter import SkillHubWpsClient, resolve_skillhub_document
 
     script = resource_path("assets/wps_airscript.js").read_text(encoding="utf-8")
     assert "xiaoyu-wps/1" in script and "return runXiaoyuWps();" in script
@@ -76,6 +79,32 @@ def run_wps_smoke():
         journal = (root / "tasks" / (plan["plan_id"] + ".json")).read_text(encoding="utf-8")
         assert binding.token not in journal and binding.endpoint not in journal
         assert "verified" in journal
+        account = WpsAccount(str(uuid.uuid4()), "offline-account-token-never-real")
+        account_path = root / "wps_account.json"
+        save_account(account, account_path)
+        assert require_account(account.account_id, account_path) == account
+        assert account.token not in account_path.read_text(encoding="utf-8")
+
+        class OfflineSkillHub:
+            def call_tool(self, name, arguments, mutation=False):
+                assert not mutation
+                if name == "get_file_info":
+                    return {"code": 0, "data": {"code": 0, "data": {
+                        "id": "synthetic-file", "name": "合成云表.xlsx", "type": "file",
+                        "permission": {"update": True}}}}
+                assert name == "sheet.get_sheets_info"
+                return {"code": 0, "data": {"detail": {"sheetsInfo": [{
+                    "sheetName": "收款", "sheetId": 1, "sheetType": "et", "isProtected": False,
+                    "rowFrom": 0, "rowTo": 2, "colFrom": 0, "colTo": 2}]}}}
+
+        rpc = OfflineSkillHub()
+        connected = resolve_skillhub_document("https://www.kdocs.cn/l/synthetic-account", account.account_id, rpc)
+        assert connected.provider == "skillhub" and not connected.token and not connected.endpoint
+        save_bindings([binding, connected], root / "providers.json")
+        assert len(load_bindings(root / "providers.json")) == 2
+        description = SkillHubWpsClient(connected, rpc=rpc).call("describe")
+        assert description["can_edit"] and description["file_id"] == "synthetic-file"
+        assert description["sheets"][0]["name"] == "收款"
     return {"mode": "offline_mock", "bundled_script": "passed", "encrypted_binding": "passed",
             "automatic_header_and_key_matching": "passed", "keyed_update_readback": "passed",
-            "journal_and_no_repeat": "passed"}
+            "journal_and_no_repeat": "passed", "encrypted_account": "passed", "account_provider": "passed"}

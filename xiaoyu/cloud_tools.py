@@ -16,10 +16,10 @@ from pathlib import Path
 import re
 import threading
 import uuid
-from urllib.parse import urlsplit
 
 from .config import data_dir
-from .wps_service import WpsBinding, WpsClient, WpsError, normalize_share_url, validate_binding
+from .wps_service import WpsBinding, WpsError, binding_identity, normalize_share_url
+from .wps_adapter import create_wps_client
 
 
 MAX_TABLE_ROWS = 5000
@@ -72,9 +72,24 @@ def _integer(value, low, high, label):
     return value
 
 
-def _binding_file_id(binding):
-    validate_binding(binding)
-    return urlsplit(binding.endpoint).path.split("/")[5]
+def _record_identity(record):
+    """Read legacy journal identities without reassigning them to a new account."""
+    if record.get("schema") == 1:
+        file_id = record.get("endpoint_file_id")
+        if isinstance(file_id, str) and re.fullmatch(r"[A-Za-z0-9_-]{1,128}", file_id):
+            return {"provider": "airscript", "account_id": "", "file_id": file_id}
+    elif record.get("schema") == 2:
+        identity = record.get("document_identity")
+        if (isinstance(identity, dict) and set(identity) == {"provider", "account_id", "file_id"}
+                and identity["provider"] in ("airscript", "skillhub")
+                and isinstance(identity["file_id"], str)
+                and re.fullmatch(r"[A-Za-z0-9_-]{1,128}", identity["file_id"])
+                and isinstance(identity["account_id"], str)
+                and ((identity["provider"] == "airscript" and identity["account_id"] == "")
+                     or (identity["provider"] == "skillhub"
+                         and re.fullmatch(r"[A-Za-z0-9_-]{1,128}", identity["account_id"])))):
+            return identity
+    raise ValueError("任务的文档身份记录不完整，请先核对任务记录。")
 
 
 def _function(name, description, properties):
@@ -94,7 +109,7 @@ def _names():
 
 class CloudDocumentTools:
     def __init__(self, bindings: list[WpsBinding], *, allow_write=False, journal_dir=None,
-                 client_factory=WpsClient):
+                 client_factory=create_wps_client):
         self.bindings = {normalize_share_url(b.share_url): b for b in bindings}
         self.allow_write = bool(allow_write)
         self.journal_dir = Path(journal_dir) if journal_dir is not None else data_dir() / "wps_tasks"
@@ -103,6 +118,7 @@ class CloudDocumentTools:
         self.questions = []
         self._pending_clarification = False
         self.snapshots = {}
+        self.document_metadata = {}
         self.plans = {}
         self._session_plan_ids = set()
         self._task_authorized = bool(allow_write)
@@ -271,13 +287,21 @@ class CloudDocumentTools:
     def _binding(self, url):
         binding = self.bindings.get(normalize_share_url(url))
         if binding is None:
-            raise ValueError("本次没有绑定这个文档，请在“云文档”中先配置并测试连接。")
+            raise ValueError("本次没有选择这份文档，请在右侧“云文档”中添加或选择。")
         if not binding.workbook_name:
-            raise ValueError("请先在云文档设置中完成只读连接测试并保存。")
+            raise ValueError("这份云文档尚未连接成功，请在右侧重新连接。")
+        binding_identity(binding)
         return binding
+
+    def _remember_metadata(self, binding, info):
+        self.document_metadata[normalize_share_url(binding.share_url)] = {
+            "can_edit": info.get("can_edit") if type(info.get("can_edit")) is bool else None,
+            "sheets": [sheet["name"] for sheet in info["sheets"]],
+        }
 
     def _metadata(self, binding, sheet):
         info = self.client_factory(binding).call("describe")
+        self._remember_metadata(binding, info)
         found = [s for s in info["sheets"] if s["name"] == sheet]
         if len(found) != 1:
             raise ValueError("没有找到指定工作表，请从实际工作表列表中选择。")
@@ -322,6 +346,7 @@ class CloudDocumentTools:
     def _inspect(self, document_url, sheet, *, cancel=None, on_status=None):
         binding = self._binding(document_url)
         info = self.client_factory(binding).call("describe")
+        self._remember_metadata(binding, info)
         result = {"ok": True, "document_url": binding.share_url, "workbook_name": info["workbook_name"], "sheets": info["sheets"]}
         if sheet is not None:
             matches = [s for s in info["sheets"] if s["name"] == sheet]
@@ -378,7 +403,7 @@ class CloudDocumentTools:
             raise ValueError("读取范围内还有重复表头，可能包含多块数据，请说明需要处理的区域或结束位置。")
         snapshot_id = uuid.uuid4().hex
         snapshot = {"snapshot_id": snapshot_id, "document_url": binding.share_url,
-                    "workbook_name": binding.workbook_name, "endpoint_file_id": _binding_file_id(binding),
+                    "workbook_name": binding.workbook_name, "document_identity": binding_identity(binding),
                     "sheet": sheet, "header_row": header,
                     "row_start": start, "row_end": end, "columns": {name: found[name]["column"] for name in columns},
                     "expected_headers": [{"column": found[name]["column"], "value": found[name]["value"]} for name in columns],
@@ -394,6 +419,9 @@ class CloudDocumentTools:
         snap = self.snapshots.get(snapshot_id)
         if snap is None:
             raise ValueError("表格快照不存在或会话已重开，请重新读取云表。")
+        binding = self._binding(snap["document_url"])
+        if binding.workbook_name != snap["workbook_name"] or binding_identity(binding) != snap["document_identity"]:
+            raise ValueError("文档绑定已变化，请重新读取并生成修改计划。")
         names = snap["columns"]
         if (not isinstance(key_columns, list) or not key_columns or len(set(key_columns)) != len(key_columns)
                 or any(k not in names for k in key_columns) or target_column not in names or target_column in key_columns):
@@ -462,8 +490,8 @@ class CloudDocumentTools:
                     changes.append({"item_index": len(items), "request": change})
             items.append(item)
         task_id = uuid.uuid4().hex
-        record = {"schema": 1, "task_id": task_id, "document_url": snap["document_url"],
-                  "document_name": snap["workbook_name"], "endpoint_file_id": snap["endpoint_file_id"],
+        record = {"schema": 2, "task_id": task_id, "document_url": snap["document_url"],
+                  "document_name": snap["workbook_name"], "document_identity": deepcopy(snap["document_identity"]),
                   "sheet": snap["sheet"], "status": "prepared",
                   "created_at": _now(), "updated_at": _now(), "rule_summary": summary,
                   "header_row": snap["header_row"], "row_start": snap["row_start"], "row_end": snap["row_end"],
@@ -532,6 +560,7 @@ class CloudDocumentTools:
     def _unresolved(self, binding, exclude):
         if not self.journal_dir.exists():
             return False
+        identity = binding_identity(binding)
         for path in self.journal_dir.glob("*.json"):
             if path.stem == exclude:
                 continue
@@ -541,10 +570,14 @@ class CloudDocumentTools:
                 item = json.loads(path.read_text(encoding="utf-8"))
             except (ValueError, UnicodeError):
                 raise ValueError("有损坏的云文档任务记录，请先检查，避免重复更新。") from None
-            if not isinstance(item, dict) or item.get("schema") != 1:
+            if not isinstance(item, dict) or item.get("schema") not in (1, 2):
                 raise ValueError("有无法识别的云文档任务记录，请先检查，避免重复更新。")
-            same_document = (item.get("endpoint_file_id") == _binding_file_id(binding)
-                             or item.get("document_url") == binding.share_url)
+            # A re-login changes account scope, not the outstanding mutation.
+            # Keep the file blocked even when it is selected through a new
+            # sharing alias. Equal file IDs are conservatively blocked across
+            # routes too; different route IDs can still match the saved URL.
+            same_document = (_record_identity(item)["file_id"] == identity["file_id"]
+                             or item.get("document_url") == normalize_share_url(binding.share_url))
             if same_document and item.get("status") in ("running", "uncertain"):
                 return True
         return False
@@ -639,7 +672,7 @@ class CloudDocumentTools:
         if record["needs_clarification"]:
             raise ValueError("修改清单含重复匹配，请先明确处理方式并重新生成计划。")
         binding = self._binding(record["document_url"])
-        if binding.workbook_name != record["document_name"] or _binding_file_id(binding) != record["endpoint_file_id"]:
+        if binding.workbook_name != record["document_name"] or binding_identity(binding) != _record_identity(record):
             raise ValueError("文档绑定已变化，请重新读取并生成修改计划。")
         with _DOCUMENT_LOCK:
             if self._unresolved(binding, plan_id):
@@ -719,7 +752,9 @@ class CloudDocumentTools:
                 if item["status"] == "planned":
                     item["status"] = "not_submitted"
             self._summarize(record)
-            if record["status"] == "running":
+            if (record["status"] == "running"
+                    or record["status"] == "partial" and record["items"]
+                    and all(item["status"] in ("verified", "unchanged") for item in record["items"])):
                 record["status"] = "partial" if record["skipped"] or record["conflicts"] else "completed"
             self._save(record)
             self._record_result(record)
@@ -731,9 +766,9 @@ class CloudDocumentTools:
         if not path.is_file() or path.stat().st_size > 32 * 1024 * 1024:
             raise ValueError("未找到可核对的本地任务记录。")
         record = json.loads(path.read_text(encoding="utf-8"))
-        required = {"document_url", "document_name", "endpoint_file_id", "sheet", "status", "changes", "items",
+        required = {"document_url", "document_name", "sheet", "status", "changes", "items",
                     "expected_headers", "key_columns", "target_column", "header_row", "row_start", "row_end", "batches"}
-        if (not isinstance(record, dict) or record.get("schema") != 1 or record.get("task_id") != task_id
+        if (not isinstance(record, dict) or record.get("schema") not in (1, 2) or record.get("task_id") != task_id
                 or not required.issubset(record) or not isinstance(record["changes"], list)
                 or not isinstance(record["items"], list) or not isinstance(record["expected_headers"], list)
                 or not isinstance(record["batches"], list)
@@ -746,9 +781,21 @@ class CloudDocumentTools:
                        or not 0 <= c["item_index"] < len(record["items"]) or not isinstance(c.get("request"), dict)
                        for c in record["changes"])):
             raise ValueError("任务记录格式不正确。")
-        binding = self._binding(record["document_url"])
-        if binding.workbook_name != record["document_name"] or _binding_file_id(binding) != record["endpoint_file_id"]:
+        identity = _record_identity(record)
+        candidates = [binding for binding in self.bindings.values()
+                      if binding.workbook_name == record["document_name"]
+                      and all(binding_identity(binding)[key] == identity[key] for key in ("provider", "file_id"))]
+        if not candidates or len({binding.account_id for binding in candidates}) != 1:
             raise ValueError("任务的文档身份与当前绑定不一致，请先核对连接。")
+        binding = next((item for item in candidates if item.share_url == record["document_url"]), candidates[0])
+        if binding_identity(binding) != identity:
+            # A new login may read/reconcile the same WPS file, but may never
+            # execute a plan authorized under a previous account scope.
+            # Require fresh server metadata before touching the old journal.
+            info = self.client_factory(binding).call("describe")
+            if info.get("file_id") != identity["file_id"] or info.get("workbook_name") != record["document_name"]:
+                raise ValueError("无法确认历史任务对应的真实云文档，请重新选择文档后核对。")
+            self._remember_metadata(binding, info)
         with _DOCUMENT_LOCK:
             self._summarize(record)
             pending = [c for c in record["changes"] if record["items"][c["item_index"]]["status"] in ("pending", "unknown")]
@@ -775,6 +822,11 @@ class CloudDocumentTools:
                         item["status"] = "not_submitted"
                 self._summarize(record)
                 record["status"] = "partial" if record["skipped"] or record["conflicts"] else "completed"
+            if (record["status"] == "partial" and record["items"]
+                    and all(item["status"] in ("verified", "unchanged") for item in record["items"])):
+                # Older runs could retain "partial" after the last response
+                # failed even though independent readback verified every item.
+                record["status"] = "completed"
             try:
                 current = self._current_check(binding, record, cancel, found)
             except (WpsError, ValueError, OSError):
