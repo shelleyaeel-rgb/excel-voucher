@@ -1,6 +1,7 @@
 import json
 import os
 import sys
+import tempfile
 from pathlib import Path
 
 # Set only by the explicit offline probe entry points, never by normal startup.
@@ -34,6 +35,21 @@ def load_config() -> dict:
 
 def save_config(value: dict):
     target = data_dir() / 'settings.json'
-    temporary = target.with_suffix('.tmp')
-    temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2, default=str), encoding='utf-8')
-    temporary.replace(target)
+    content = json.dumps(value, ensure_ascii=False, indent=2, default=str)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', newline='\n',
+                                         prefix='.settings-', suffix='.tmp',
+                                         dir=target.parent, delete=False) as handle:
+            temporary = Path(handle.name)
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        temporary.replace(target)
+    finally:
+        if temporary is not None:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                # Preserve the original save error if Windows also blocks cleanup.
+                pass

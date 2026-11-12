@@ -16,7 +16,7 @@ def _self_test(report_path: str) -> int:
     from xiaoyu.engine import generate
     from xiaoyu.service import InputBundle, default_template_path
     from xiaoyu.spreadsheet_io import export_vouchers, read_sheets, read_template
-    from xiaoyu.config import resource_path
+    from xiaoyu.config import load_config, resource_path
     from PySide6.QtWidgets import QApplication
     from xiaoyu import ui
     report = {"ok": False}
@@ -50,8 +50,6 @@ def _self_test(report_path: str) -> int:
                     assert rows[0] == template.headers and len(rows) == 3
                     assert Path(output['issues_path']).is_file()
         app = QApplication.instance() or QApplication([])
-        ui.load_config = lambda: {}
-        ui.save_config = lambda value: None
         with tempfile.TemporaryDirectory(prefix='xiaoyu-material-smoke-') as directory:
             import openpyxl
             from xiaoyu.imports import ImportResult, inspect_workbook, parse_workbook
@@ -107,6 +105,8 @@ def _self_test(report_path: str) -> int:
             account_combo.lineEdit().editingFinished.emit()
             assert account_combo.currentText() == '2211  应付职工薪酬'
             assert window._read_options().mappings['自检员工'] == '2211'
+            assert window._save_settings(), window.statusBar().currentMessage()
+            assert load_config()['options']['mappings']['自检员工'] == '2211'
             window.close()
             window.deleteLater()
             app.processEvents()
@@ -117,6 +117,7 @@ def _self_test(report_path: str) -> int:
                       account_name_resolution='passed', account_input_gui='passed', invalid_account_export='passed',
                       flexible_imports=['bank', 'payroll', 'logistics', 'invoice'], material_store='passed',
                       mapping_confirmation='passed', company_isolation='passed', material_export='passed',
+                      settings_save='passed',
                       finance_ai=ai_report)
     except Exception:
         report['error'] = traceback.format_exc()

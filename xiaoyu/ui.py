@@ -1369,7 +1369,9 @@ class MainWindow(QMainWindow):
         self.export_format.setCurrentIndex(max(0, extension_index))
 
     def _save_settings(self):
+        self._settings_save_error = ""
         if self._updating:
+            self._settings_save_error = "界面正在加载，请稍后重试。"
             return False
         options = {
             "period": self._current_period(),
@@ -1395,7 +1397,11 @@ class MainWindow(QMainWindow):
         try:
             save_config(self._config)
         except Exception as exc:
-            self.statusBar().showMessage(f"本次设置暂未保存：{exc}")
+            self._settings_save_error = str(exc) or type(exc).__name__
+            if isinstance(exc, OSError) and exc.filename:
+                location = Path(exc.filename2 or exc.filename).as_posix()
+                self._settings_save_error = f"{exc.strerror}\n文件位置：{location}"
+            self.statusBar().showMessage(f"本次设置暂未保存：{self._settings_save_error}")
             return False
         return True
 
@@ -1450,7 +1456,9 @@ class MainWindow(QMainWindow):
         self._save_timer.stop()
         saved = self._save_settings()
         if self.update_controller.has_ready_update and not saved:
-            self._notify("设置暂未保存，本次先不更新。请检查保存位置后重试。", "error")
+            self._notify(f"设置暂未保存，本次先不更新。{self._settings_save_error}\n"
+                         "请确认软件文件夹可以保存文件，并关闭正在占用设置文件的程序后重试。", "error")
+            self.notice.show()
             event.ignore()
             return
         if not self.update_controller.prepare_close(

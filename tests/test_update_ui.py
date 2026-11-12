@@ -1,8 +1,11 @@
 """Offline Qt checks for startup-only updates and safe exit handoff."""
 from __future__ import annotations
 
+import errno
+import json
 import os
 from pathlib import Path
+import stat
 import threading
 import time
 from types import SimpleNamespace
@@ -13,7 +16,7 @@ import pytest
 from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import QApplication, QWidget
 
-from xiaoyu import ui, update_ui
+from xiaoyu import config, ui, update_ui
 
 
 @pytest.fixture(scope="module")
@@ -287,3 +290,71 @@ def test_restart_button_only_restarts_when_close_succeeds(window_factory, tmp_pa
     window.update_controller.restart_button.click()
     assert preparations == [True]
     assert not window.isVisible()
+
+
+def test_restart_saves_settings_despite_read_only_legacy_temporary_file(
+        window_factory, tmp_path, monkeypatch):
+    window, preparations = window_factory()
+    data_path = tmp_path / "settings-data"
+    data_path.mkdir()
+    legacy_temporary = data_path / "settings.tmp"
+    legacy_temporary.write_text("旧版留下的临时设置", encoding="utf-8")
+    legacy_temporary.chmod(stat.S_IREAD)
+    monkeypatch.setattr(config, "_TEST_DATA_DIR", data_path)
+    monkeypatch.setattr(ui, "save_config", config.save_config)
+    window.preparer.setText("新制单人")
+    ready_candidate(window.update_controller, tmp_path)
+
+    try:
+        window.update_controller.restart_button.click()
+
+        assert preparations == [True]
+        assert not window.isVisible()
+        saved = json.loads((data_path / "settings.json").read_text(encoding="utf-8"))
+        assert saved["options"]["preparer"] == "新制单人"
+        assert legacy_temporary.read_text(encoding="utf-8") == "旧版留下的临时设置"
+    finally:
+        legacy_temporary.chmod(stat.S_IREAD | stat.S_IWRITE)
+
+
+def test_restart_reports_real_save_failure_and_succeeds_after_retry(
+        window_factory, tmp_path, monkeypatch):
+    window, preparations = window_factory()
+    data_path = tmp_path / "settings-data"
+    data_path.mkdir()
+    target = data_path / "settings.json"
+    original = '{"options": {"preparer": "原制单人"}}'
+    target.write_text(original, encoding="utf-8")
+    monkeypatch.setattr(config, "_TEST_DATA_DIR", data_path)
+    monkeypatch.setattr(ui, "save_config", config.save_config)
+    original_replace = Path.replace
+
+    def fail_settings_replace(path, destination):
+        if Path(destination) == target:
+            raise PermissionError(errno.EACCES, "测试设置文件被占用", str(target))
+        return original_replace(path, destination)
+
+    monkeypatch.setattr(Path, "replace", fail_settings_replace)
+    window.preparer.setText("新制单人")
+    ready_candidate(window.update_controller, tmp_path)
+    window.notice.hide()
+    window.update_controller.restart_button.click()
+
+    assert not preparations
+    assert window.isVisible()
+    assert window.update_controller.has_ready_update
+    assert not window._restart_after_update
+    assert window.notice.isVisible()
+    assert "设置暂未保存" in window.notice.text()
+    assert target.as_posix() in window.notice.text()
+    assert "测试设置文件被占用" in window.notice.text()
+    assert target.read_text(encoding="utf-8") == original
+
+    monkeypatch.setattr(Path, "replace", original_replace)
+    window.update_controller.restart_button.click()
+
+    assert preparations == [True]
+    assert not window.isVisible()
+    assert not window._restart_after_update
+    saved = json.loads(target.read_text(encoding="utf-8"))
+    assert saved["options"]["preparer"] == "新制单人"
