@@ -359,6 +359,77 @@ def apply_args(**overrides):
     return value
 
 
+def merged_header_args():
+    merge = dict(start_row=1, end_row=1, start_column=2, end_column=3)
+    return apply_args(target_column=3, expected_headers=[dict(column=1, value="单号"),
+        dict(column=2, value="日期", merge_range=dict(merge)),
+        dict(column=3, value="", merge_range=dict(merge))], changes=[change(old_value="", new_value=46332,
+            old_number_format="yyyy-mm-dd", guards=[dict(column=1, value="001", formula=""),
+            dict(column=2, value=11, formula="=MONTH(C2)"), dict(column=3, value="", formula="")])])
+
+
+def test_valid_merged_header_plan_is_refused_by_legacy_transport_before_request():
+    args = merged_header_args()
+    wps._validate_request("apply", args)  # Valid for the account adapter's guarded path.
+    opener = Opener()
+    with pytest.raises(wps.WpsError) as caught:
+        wps.WpsClient(binding(), opener).call("apply", **args)
+    assert caught.value.code == "UNSUPPORTED_HEADER_MAPPING"
+    assert not caught.value.mutation_attempted and not opener.requests
+    assert "WPS 账号连接" in str(caught.value) and "未写入" in str(caught.value)
+
+
+def test_legacy_script_also_refuses_new_header_guard_schema_without_writes():
+    output = run_script("apply", merged_header_args(), table())
+    assert output["result"]["code"] == "INVALID_ARGUMENTS"
+    assert not output["result"]["mutation_attempted"]
+    assert not output["writes"] and output["saves"] == 0
+
+
+@pytest.mark.parametrize("merge", [None, [],
+    dict(start_row=1, end_row=1, start_column=2),
+    dict(start_row=1, end_row=1, start_column=2, end_column=3, extra="inert"),
+    dict(start_row=1, end_row=2, start_column=2, end_column=3),
+    dict(start_row=2, end_row=2, start_column=2, end_column=3),
+    dict(start_row=1, end_row=1, start_column=0, end_column=3),
+    dict(start_row=1, end_row=1, start_column=3, end_column=3),
+    dict(start_row=1, end_row=1, start_column=3, end_column=2),
+    dict(start_row=1, end_row=1, start_column=2, end_column=16385),
+    dict(start_row=1, end_row=1, start_column=2.0, end_column=3),
+    dict(start_row=True, end_row=1, start_column=2, end_column=3)])
+def test_invalid_merge_guard_is_refused_before_any_request(merge):
+    args = merged_header_args()
+    for header in args["expected_headers"][1:]:
+        header["merge_range"] = merge
+    opener = Opener()
+    with pytest.raises(wps.WpsError) as caught:
+        wps.WpsClient(binding(), opener).call("apply", **args)
+    assert caught.value.code == "INVALID_ARGUMENTS"
+    assert not caught.value.mutation_attempted and not opener.requests
+
+
+@pytest.mark.parametrize("fault", ["missing_anchor", "unmerged_anchor", "changed_range", "blank_name", "nontext_name"])
+def test_merged_child_guard_requires_matching_named_anchor(fault):
+    args = merged_header_args()
+    anchor = args["expected_headers"][1]
+    if fault == "missing_anchor":
+        args["expected_headers"].pop(1)
+        args["changes"][0]["guards"] = [g for g in args["changes"][0]["guards"] if g["column"] != 2]
+    elif fault == "unmerged_anchor":
+        anchor.pop("merge_range")
+    elif fault == "changed_range":
+        anchor["merge_range"]["end_column"] = 4
+    elif fault == "blank_name":
+        anchor["value"] = "  "
+    else:
+        anchor["value"] = 11
+    opener = Opener()
+    with pytest.raises(wps.WpsError) as caught:
+        wps.WpsClient(binding(), opener).call("apply", **args)
+    assert caught.value.code == "INVALID_ARGUMENTS"
+    assert not caught.value.mutation_attempted and not opener.requests
+
+
 def test_real_script_describe_and_read_blank_zero_false():
     described = run_script("describe")
     assert described["result"]["sheets"] == result()["sheets"]

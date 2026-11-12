@@ -14,8 +14,11 @@ import uuid
 from collections import Counter
 from dataclasses import replace
 
+from openpyxl.styles.numbers import is_date_format
+
 from .wps_service import (PROTOCOL, WpsBinding, WpsClient, WpsError, _integer,
-                          _scalar, _validate_request, normalize_share_url, validate_binding)
+                          _scalar, _validate_request, header_matches, normalize_share_url,
+                          target_value_matches, validate_binding)
 from .wps_snapshot import load_blank_cells, normalize_number_format
 
 UNKNOWN_FORMAT = "[WPS 未返回空白单元格格式]"
@@ -205,8 +208,9 @@ class SkillHubWpsClient:
                 time.sleep(attempt + 1)
 
     def _read_once(self, rpc, sheet, start, end, columns, *, complete_blanks=True):
-        # The sparse API omits formatted blanks. Capture the file version
-        # before reading, then verify a signed XLSX export against live cells.
+        # The sparse API omits formatted blanks and the workbook date epoch.
+        # Capture the version before reading, then verify an XLSX export
+        # against live cells whenever either kind of metadata is needed.
         info = _file_info(rpc, file_id=self.binding.file_id) if complete_blanks else None
         if info is not None and (info["id"] != self.binding.file_id or info["name"] != self.binding.workbook_name):
             raise WpsError("云文档身份或名称已变化，请重新添加后再处理。", code="WORKBOOK_MISMATCH")
@@ -250,11 +254,24 @@ class SkillHubWpsClient:
                     _invalid()
                 for record in merged:
                     a, b, c, d = _bounds(record, ("row_from", "row_to", "col_from", "col_to"))
+                    area = dict(start_row=a + 1, end_row=b + 1,
+                                start_column=c + 1, end_column=d + 1)
                     for row in range(max(a, r0), min(b, r1) + 1):
                         for col in range(max(c, c0), min(d, c1) + 1):
-                            cells[(row + 1, col + 1)]["merged"] = True
+                            cell = cells[(row + 1, col + 1)]
+                            if cell.get("merge_range", area) != area:
+                                _invalid()
+                            cell["merged"] = True
+                            # Only the independent merge-range API supplies
+                            # trusted boundaries, including an anchor outside
+                            # the requested columns. Sparse cell flags alone
+                            # must never establish a header-to-column mapping.
+                            cell["merge_range"] = dict(area)
         missing = {key for key, cell in cells.items() if cell["number_format"] == UNKNOWN_FORMAT and not cell["merged"]}
-        if complete_blanks and missing and self.binding.workbook_name.lower().endswith(".xlsx"):
+        date_cells = {key for key, cell in cells.items()
+                      if not cell["merged"] and cell["number_format"] != UNKNOWN_FORMAT
+                      and is_date_format(cell["number_format"])}
+        if complete_blanks and (missing or date_cells) and self.binding.workbook_name.lower().endswith(".xlsx"):
             def anchors(items):
                 # External-book references have different textual spellings in
                 # live API formulas and OOXML. Prefer ordinary, typed values.
@@ -273,10 +290,14 @@ class SkillHubWpsClient:
                 known = dict([next(iter(candidates.items()))]) if candidates else {}
             if not known:
                 known = {key: cell for key, cell in (cells | extra).items() if cell["formula"]}
+            # The live API does not include the workbook's date system. Verify
+            # filled dates against the same XLSX used for sparse blanks rather
+            # than losing their epoch as soon as they become nonempty.
+            known.update({key: cells[key] for key in date_cells})
             if type(info.get("version")) is not int or info["version"] < 1:
                 _invalid()
             blanks = load_blank_cells(rpc, self.binding.file_id, sheet["sheetName"], missing, known,
-                                      expected_version=info["version"])
+                                      expected_version=info["version"], metadata_coordinates=date_cells)
             for (row, column), cell in blanks.items():
                 cells[(row, column)] = dict(cell, column=column)
         return cells
@@ -320,7 +341,7 @@ class SkillHubWpsClient:
         headers = self._read(rpc, sheet, args["header_row"], args["header_row"], columns)
         for expected in args["expected_headers"]:
             item = headers[(args["header_row"], expected["column"])]
-            if item["merged"] or not _same(item["value"], expected["value"]):
+            if not header_matches(item, expected, args["header_row"]):
                 raise WpsError("云表表头已变化，请重新读取后处理。", code="HEADER_MISMATCH")
         key_columns, target = args["key_columns"], args["target_column"]
         cells = self._read(rpc, sheet, args["row_start"], args["row_end"], columns)
@@ -389,7 +410,8 @@ class SkillHubWpsClient:
             after = self._read(rpc, sheet, min(o[0]["row"] for o in pending), max(o[0]["row"] for o in pending), columns)
             for outcome, before, new in pending:
                 item = after[(outcome["row"], target)]
-                if (not _same(item["value"], new) or item["has_formula"] or item["merged"]
+                if (not target_value_matches(item["value"], new, before["number_format"])
+                        or item["has_formula"] or item["merged"]
                         or item["number_format"] != before["number_format"]):
                     raise WpsError("云表写入后核对不一致，请先查看处理记录。", code="WRITE_VERIFY_FAILED", mutation_attempted=True)
                 outcome["status"] = "applied"

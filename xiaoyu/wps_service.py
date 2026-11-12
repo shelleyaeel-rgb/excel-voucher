@@ -14,7 +14,9 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field, replace
+from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_HALF_UP, localcontext
 from pathlib import Path
+from openpyxl.styles.numbers import is_date_format
 
 from .ai_settings import _atomic_write, _decrypt_key, _encrypt_key
 from .config import data_dir
@@ -36,15 +38,34 @@ _SCRIPT_CODES = {
 }
 
 
+def safe_wps_diagnostic(value):
+    """Allow only location/category metadata, never cell contents or URLs."""
+    if not isinstance(value, dict):
+        return {}
+    result = {}
+    if isinstance(value.get("stage"), str) and value["stage"] in {"snapshot", "download", "metadata", "read", "apply", "verify"}:
+        result["stage"] = value["stage"]
+    if isinstance(value.get("field"), str) and value["field"] in {"value", "type", "formula", "number_format", "merged", "version", "hash", "identity"}:
+        result["field"] = value["field"]
+    sheet = value.get("sheet")
+    if isinstance(sheet, str) and 0 < len(sheet) <= 255 and not any(ord(c) < 32 for c in sheet):
+        result["sheet"] = sheet
+    for key, limit in (("row", 1048576), ("column", 16384)):
+        if type(value.get(key)) is int and 1 <= value[key] <= limit:
+            result[key] = value[key]
+    return result
+
+
 class WpsError(ValueError):
     """Safe, user-displayable error; unknown writes must be reconciled first."""
 
     def __init__(self, message: str, *, code: str = "WPS_ERROR", mutation_attempted: bool = False,
-                 result: dict | None = None):
+                 result: dict | None = None, diagnostic: dict | None = None):
         super().__init__(message)
         self.code = code
         self.mutation_attempted = mutation_attempted
         self.result = result
+        self.diagnostic = safe_wps_diagnostic(diagnostic)
 
 
 @dataclass
@@ -212,6 +233,54 @@ def _columns(value):
             and all(_integer(c, 1, 16384) for c in value) and len(set(value)) == len(value))
 
 
+def valid_header_merge(value, row, column):
+    return (isinstance(value, dict)
+            and set(value) == {"start_row", "end_row", "start_column", "end_column"}
+            and all(type(v) is int for v in value.values())
+            and value["start_row"] == value["end_row"] == row
+            and 1 <= row <= 100000
+            and 1 <= value["start_column"] < value["end_column"] <= 16384
+            and value["start_column"] <= column <= value["end_column"])
+
+
+def header_matches(cell, expected, row):
+    left, right = cell.get("value"), expected.get("value")
+    same = (type(left) is type(right) or type(left) in (int, float) and type(right) in (int, float)) and left == right
+    if "merge_range" in expected:
+        return (same and valid_header_merge(expected["merge_range"], row, expected["column"])
+                and cell.get("merged") is True and cell.get("merge_range") == expected["merge_range"])
+    return same and cell.get("merged") is False
+
+
+def target_value_matches(actual, expected, number_format):
+    """Accept WPS's precise date-serial encoding only; keys/guards stay strict.
+
+    WPS keeps 15 significant decimal digits when storing a date number. The
+    expected truncation must match exactly AND preserve the timestamp at
+    millisecond resolution. No general float tolerance is used.
+    """
+    if (type(actual) is type(expected) or type(actual) in (int, float) and type(expected) in (int, float)) and actual == expected:
+        return True
+    if (type(actual) not in (int, float) or type(expected) not in (int, float)
+            or not isinstance(number_format, str) or len(number_format) > 1024
+            or not is_date_format(number_format)):
+        return False
+    try:
+        with localcontext() as context:
+            context.prec = 40
+            saved, requested = Decimal(str(actual)), Decimal(str(expected))
+            if not saved.is_finite() or not requested.is_finite() or requested == 0:
+                return False
+            stored = requested.quantize(Decimal(1).scaleb(requested.adjusted() - 14), rounding=ROUND_DOWN)
+            if saved != stored:
+                return False
+            milliseconds = Decimal(86400000)
+            return ((saved * milliseconds).to_integral_value(rounding=ROUND_HALF_UP)
+                    == (requested * milliseconds).to_integral_value(rounding=ROUND_HALF_UP))
+    except (InvalidOperation, ValueError, OverflowError):
+        return False
+
+
 def _validate_request(action, payload):
     valid = action in ("describe", "read", "apply")
     allowed = {
@@ -234,9 +303,21 @@ def _validate_request(action, payload):
         headers, changes = payload["expected_headers"], payload["changes"]
         valid = valid and isinstance(headers, list) and 1 <= len(headers) <= 60 and isinstance(changes, list) and 1 <= len(changes) <= 100
         if valid:
-            valid = all(isinstance(h, dict) and set(h) == {"column", "value"} and _integer(h["column"], 1, 16384) and _scalar(h["value"]) for h in headers)
+            valid = all(isinstance(h, dict) and set(h) in ({"column", "value"}, {"column", "value", "merge_range"})
+                        and _integer(h["column"], 1, 16384) and _scalar(h["value"])
+                        and ("merge_range" not in h or valid_header_merge(h["merge_range"], payload["header_row"], h["column"]))
+                        for h in headers)
             cols = [h["column"] for h in headers] if valid else []
             valid = valid and len(set(cols)) == len(cols) and set(payload["key_columns"] + [payload["target_column"]]).issubset(cols)
+            if valid:
+                by_column = {h["column"]: h for h in headers}
+                for header in headers:
+                    if "merge_range" in header:
+                        anchor = by_column.get(header["merge_range"]["start_column"], {})
+                        if (anchor.get("merge_range") != header["merge_range"]
+                                or not isinstance(anchor.get("value"), str) or not anchor["value"].strip()):
+                            valid = False
+                            break
         if valid:
             for change in changes:
                 if not isinstance(change, dict) or set(change) != {"row", "key_values", "old_value", "old_formula", "old_number_format", "new_value", "guards"}:
@@ -277,6 +358,9 @@ class WpsClient:
     def call(self, action: str, **payload) -> dict:
         validate_binding(self.binding)
         _validate_request(action, payload)
+        if action == "apply" and any("merge_range" in h for h in payload["expected_headers"]):
+            raise WpsError("合并表头的输入列需要使用 WPS 账号连接，旧共享脚本不支持；本次未写入。",
+                           code="UNSUPPORTED_HEADER_MAPPING")
         if not self.binding.workbook_name and action != "describe":
             raise WpsError("请先连接并校验云文档，再读取或更新内容。", code="NAME_REQUIRED")
         argv = dict(payload, action=action, protocol=PROTOCOL, expected_workbook_name=self.binding.workbook_name)

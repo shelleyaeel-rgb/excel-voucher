@@ -381,6 +381,9 @@ class FinanceAIPage(QWidget):
                 self._account_error = str(exc)
         self.cloud_results = []
         self._clarification_buttons = []
+        self._mapping_inputs = []
+        self._mapping_choice_buttons = []
+        self._mapping_forms = []
         self._wps_load_error = ''
         try:
             self.wps_bindings = load_bindings(self.wps_path)
@@ -750,6 +753,7 @@ class FinanceAIPage(QWidget):
     def _message_changed(self):
         links = extract_share_links(self.message_edit.toPlainText())
         if links and links != self._selected_cloud_links:
+            self._invalidate_mapping_ui('目标云文档已变化')
             self._selected_cloud_links = links
             self._refresh_cloud_summary()
             self.cloud_tabs.setCurrentIndex(1)
@@ -765,6 +769,7 @@ class FinanceAIPage(QWidget):
     def _select_cloud_link(self, link):
         link = normalize_share_url(link)
         if link not in self._selected_cloud_links:
+            self._invalidate_mapping_ui('目标云文档已变化')
             self._selected_cloud_links.append(link)
         self._refresh_cloud_summary()
         self.cloud_tabs.setCurrentIndex(1)
@@ -788,6 +793,7 @@ class FinanceAIPage(QWidget):
         if self.is_busy or item is None:
             return
         link = item.data(Qt.ItemDataRole.UserRole)
+        self._invalidate_mapping_ui('目标云文档已变化')
         self._selected_cloud_links = [value for value in self._selected_cloud_links if value != link]
         # A link left in the draft would otherwise silently re-associate it on Send.
         pattern = r'https://(?:www\.)?kdocs\.cn/l/[A-Za-z0-9_-]+/?(?:\?[^\s<>]+)?(?:#[^\s<>]+)?'
@@ -949,6 +955,13 @@ class FinanceAIPage(QWidget):
         self.use_recent_cloud_button.setEnabled(not busy and self.recent_cloud_list.currentItem() is not None)
         for button in self._clarification_buttons:
             button.setEnabled(not busy)
+        for field in self._mapping_inputs:
+            field.setEnabled(not busy)
+        for button in self._mapping_choice_buttons:
+            button.setEnabled(not busy)
+        for form in self._mapping_forms:
+            if form['submitted']:
+                form['button'].setEnabled(False)
 
     def _render_chat(self):
         if not self.messages:
@@ -1005,6 +1018,7 @@ class FinanceAIPage(QWidget):
         if self.is_busy or self._closed:
             return
         errors = []
+        previous_count = len(self.pending_paths)
         existing = {str(Path(path).resolve()).casefold() for path in self.pending_paths} | {
             str(Path(path).resolve()).casefold() for path in self.source_paths}
         for value in paths:
@@ -1027,6 +1041,8 @@ class FinanceAIPage(QWidget):
                 self.pending_paths.append(path)
             except (OSError, ValueError) as exc:
                 errors.append(str(exc))
+        if len(self.pending_paths) != previous_count:
+            self._invalidate_mapping_ui('来源文件已变化')
         self._refresh_files()
         if errors:
             self._status(' '.join(dict.fromkeys(errors)), error=True)
@@ -1037,6 +1053,7 @@ class FinanceAIPage(QWidget):
         row = self.attachment_list.currentRow()
         if not self.is_busy and 0 <= row < len(self.pending_paths):
             del self.pending_paths[row]
+            self._invalidate_mapping_ui('来源文件已变化')
             self._refresh_files()
 
     def dragEnterEvent(self, event):
@@ -1073,7 +1090,7 @@ class FinanceAIPage(QWidget):
                     raise ValueError('invalid task path')
                 record = json.loads(path.read_text(encoding='utf-8'))
                 if (not isinstance(record, dict) or type(record.get('schema')) is not int
-                        or record['schema'] != 1 or record.get('task_id') != task_id):
+                        or record['schema'] not in (1, 2) or record.get('task_id') != task_id):
                     raise ValueError('invalid task record')
                 links = [normalize_share_url(record.get('document_url', ''))]
             except (WpsError, ValueError, OSError, TypeError):
@@ -1314,8 +1331,12 @@ class FinanceAIPage(QWidget):
                     pass
                 self._job.result_accounted = True
                 self._refresh_usage()
-            if self.messages and self.messages[-1][0] == 'assistant' and not self.messages[-1][1]:
+            discard_partial = getattr(exc, 'discard_partial_text', False) is True
+            if (self.messages and self.messages[-1][0] == 'assistant'
+                    and (discard_partial or not self.messages[-1][1])):
                 self.messages.pop()
+            if discard_partial:
+                self._partial_text = ''
             self.messages.append(('notice', text))
             self._render_chat()
         self._status(text, error=not isinstance(exc, RequestCancelled))
@@ -1355,17 +1376,51 @@ class FinanceAIPage(QWidget):
 
     def _clear_cloud_questions(self):
         self._clarification_buttons.clear()
+        self._mapping_inputs.clear()
+        self._mapping_choice_buttons.clear()
+        self._mapping_forms.clear()
         while self.question_layout.count():
             item = self.question_layout.takeAt(0)
             if item.widget() is not None:
                 item.widget().deleteLater()
         self.question_scroll.hide()
+        self.question_scroll.setMaximumHeight(180)
+
+    def _invalidate_mapping_ui(self, reason):
+        invalidate = getattr(self._cloud_tools, 'invalidate_mapping', None)
+        if callable(invalidate):
+            invalidate(reason)
+        if self._mapping_forms:
+            self._clear_cloud_questions()
+
+    def _pending_mapping_questions(self):
+        pending = getattr(self._cloud_tools, 'pending_mapping_questions', None)
+        if callable(pending):
+            result = pending()
+            return result if isinstance(result, list) else []
+        questions = getattr(self._cloud_tools, 'questions', [])
+        return [item for item in questions if isinstance(item, dict) and item.get('kind') == 'mapping'] \
+            if isinstance(questions, list) else []
+
+    def _save_mapping_draft(self, mapping_id, fields, owner):
+        if owner is not self._cloud_tools:
+            return
+        update = getattr(owner, 'update_mapping_draft', None)
+        if not mapping_id or not callable(update):
+            return
+        try:
+            update(mapping_id, {target: field.currentText().strip() for target, field, note in fields})
+        except ValueError:
+            # An expired scope or incomplete typed field is not confirmation.
+            pass
 
     def _show_cloud_questions(self):
         self._clear_cloud_questions()
         questions = getattr(self._cloud_tools, 'questions', []) if self._cloud_tools is not None else []
         if not isinstance(questions, list):
             return
+        questions = self._pending_mapping_questions() + [item for item in questions
+                    if not isinstance(item, dict) or item.get('kind') != 'mapping']
         shown = 0
         for item in questions:
             if not isinstance(item, dict) or not isinstance(item.get('question'), str) or not item['question'].strip():
@@ -1377,6 +1432,14 @@ class FinanceAIPage(QWidget):
             label = _label(question, 'sectionTitle', True)
             label.setTextFormat(Qt.TextFormat.PlainText)
             box.addWidget(label)
+            if item.get('kind') == 'mapping':
+                if not self._add_mapping_form(box, item, question):
+                    card.deleteLater()
+                    continue
+                self.question_layout.addWidget(card)
+                self.question_scroll.setMaximumHeight(320)
+                shown += 1
+                continue
             choices = QGridLayout()
             options = item.get('options', [])
             if not isinstance(options, list):
@@ -1400,6 +1463,117 @@ class FinanceAIPage(QWidget):
         self.question_scroll.setVisible(shown > 0)
         self._sync_controls()
 
+    def _add_mapping_form(self, box, item, question):
+        from .cloud_mapping import KEEP_SOURCE, validate_mappings
+        try:
+            mappings = validate_mappings(item.get('mappings'))
+        except ValueError:
+            return False
+        sheet = self._redact(str(item.get('sheet', '')))
+        hint = _label(f'工作表：{sheet}。请逐行选择来源字段；不需要填写的列选“{KEEP_SOURCE}”。公式列保持计算。', 'small', True)
+        hint.setTextFormat(Qt.TextFormat.PlainText)
+        box.addWidget(hint)
+        grid = QGridLayout()
+        grid.setColumnStretch(1, 1)
+        grid.addWidget(_label('云表中的列', 'small'), 0, 0)
+        grid.addWidget(_label('来源字段 / 处理方式', 'small'), 0, 1)
+        fields = []
+        choice_buttons = []
+        mapping_id = item.get('mapping_id')
+        owner = self._cloud_tools
+        selections = item.get('user_selections', {})
+        if not isinstance(selections, dict):
+            selections = {}
+        for index, mapping in enumerate(mappings):
+            target = self._redact(mapping['target_column'])
+            label = _label(target, wrap=True)
+            label.setTextFormat(Qt.TextFormat.PlainText)
+            label.setMaximumWidth(160)
+            combo = QComboBox()
+            combo.setEditable(True)
+            combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+            combo.setMinimumWidth(170)
+            combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+            combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+            combo.setMinimumContentsLength(10)
+            combo.lineEdit().setMaxLength(200)
+            combo.lineEdit().setPlaceholderText('请逐行选择，或输入列表中的字段')
+            combo.setAccessibleName(target + '的来源字段')
+            options = [self._redact(option) for option in mapping['source_options']]
+            if KEEP_SOURCE not in options:
+                options.append(KEEP_SOURCE)
+            combo.addItems(options)
+            combo.setMaxVisibleItems(12)
+            combo.completer().setFilterMode(Qt.MatchFlag.MatchContains)
+            combo.setCurrentIndex(-1)
+            # Only a draft explicitly selected by this user may be restored.
+            # AI selected_source is a recommendation, never a user decision.
+            if mapping_id and isinstance(selections.get(mapping['target_column']), str):
+                combo.setEditText(self._redact(selections[mapping['target_column']]))
+            chooser = QWidget()
+            chooser_row = QHBoxLayout(chooser)
+            chooser_row.setContentsMargins(0, 0, 0, 0)
+            chooser_row.setSpacing(6)
+            chooser_row.addWidget(combo, 1)
+            choose_button = _button('选择', combo.showPopup)
+            choose_button.setToolTip('展开来源候选；也可以在左侧直接输入。')
+            choose_button.setAccessibleName('选择' + target + '的来源字段')
+            chooser_row.addWidget(choose_button)
+            grid.addWidget(label, index * 2 + 1, 0)
+            grid.addWidget(chooser, index * 2 + 1, 1)
+            if mapping['note']:
+                note = _label(self._redact(mapping['note']), 'small', True)
+                note.setTextFormat(Qt.TextFormat.PlainText)
+                grid.addWidget(note, index * 2 + 2, 1)
+            fields.append((target, combo, self._redact(mapping['note'])))
+            self._mapping_inputs.append(combo)
+            self._mapping_choice_buttons.append(choose_button)
+            choice_buttons.append(choose_button)
+            combo.currentTextChanged.connect(lambda text, mid=mapping_id, values=fields, source=owner:
+                                             self._save_mapping_draft(mid, values, source))
+        box.addLayout(grid)
+        button = _button('确认全部列对应', primary=True)
+        button.clicked.connect(lambda checked=False, q=question, s=sheet, fields=fields:
+                               self._answer_mapping(q, s, fields))
+        box.addWidget(button, 0, Qt.AlignmentFlag.AlignRight)
+        self._clarification_buttons.append(button)
+        self._mapping_forms.append({'question': question, 'sheet': sheet,
+                                    'fields': fields, 'button': button, 'mapping_id': mapping_id,
+                                    'owner': owner, 'submitted': False, 'choice_buttons': choice_buttons})
+        return True
+
+    def _answer_mapping(self, question, sheet, fields):
+        if self.is_busy or self._closed:
+            return
+        form = next((form for form in self._mapping_forms if form['fields'] is fields
+                     and form['question'] == question and form['sheet'] == sheet), None)
+        if form is None or form['submitted'] or form['owner'] is not self._cloud_tools:
+            return
+        if form['mapping_id'] and not any(item.get('mapping_id') == form['mapping_id']
+                                         for item in self._pending_mapping_questions() if isinstance(item, dict)):
+            self._clear_cloud_questions()
+            self._status('这份列对应已失效，请按当前文件和要求重新生成。', error=True)
+            return
+        from .cloud_mapping import mapping_answer_text
+        mappings = []
+        for target, field, note in fields:
+            source = field.currentText().strip()
+            if not source or any(ord(character) < 32 for character in source):
+                self._status(f'请为“{target}”选择或输入来源字段，再确认全部列对应。', error=True)
+                field.setFocus()
+                self.question_scroll.ensureWidgetVisible(field)
+                return
+            if field.findText(source, Qt.MatchFlag.MatchExactly) < 0:
+                self._status(f'“{target}”的来源不在候选列表中，请点击“选择”使用实际字段。', error=True)
+                field.setFocus()
+                self.question_scroll.ensureWidgetVisible(field)
+                return
+            mappings.append((target, source))
+        answer = mapping_answer_text(sheet, mappings)
+        form['submitted'] = True
+        form['button'].setEnabled(False)
+        self._answer_cloud_question(question, answer)
+
     def _answer_cloud_question(self, question, answer):
         if self.is_busy or self._closed:
             return
@@ -1413,6 +1587,22 @@ class FinanceAIPage(QWidget):
         def count(key):
             value = result.get(key, 0)
             return value if type(value) is int and value >= 0 else 0
+        final_check = result.get('final_check')
+        if isinstance(final_check, dict) and result.get('last_action') != 'check':
+            differences = sum(value for key in ('changed', 'missing', 'duplicate')
+                              if type(value := final_check.get(key)) is int and value > 0)
+            if count('unknown'):
+                state = '结果待核对'
+            elif final_check.get('failed') is True:
+                state = '整体核对未完成'
+            elif differences:
+                state = f'整体核对有 {differences} 项不同/无法定位'
+            elif result.get('status') == 'completed' and not count('conflicts'):
+                state = '全部列已核对完成'
+            else:
+                state = '部分完成 · 已完成项目已核对'
+            return (f"{state} · 更新 {count('updated')} · 未变化 {count('unchanged')}"
+                    f" · 跳过 {count('skipped')} · 冲突 {count('conflicts')} · 待核对 {count('unknown')}")
         current = result.get('current_check')
         if isinstance(current, dict):
             def checked_count(key):
@@ -1451,6 +1641,8 @@ class FinanceAIPage(QWidget):
         for result in results:
             if not isinstance(result, dict):
                 continue
+            if result.get('parent_task_id'):
+                continue
             try:
                 normalize_share_url(result.get('document_url', ''))
             except (WpsError, ValueError, TypeError):
@@ -1465,6 +1657,9 @@ class FinanceAIPage(QWidget):
         self.cloud_result_list.clear()
         for result in self.cloud_results:
             name = str(result.get('document_name') or '云文档')
+            columns = result.get('columns')
+            if isinstance(columns, list) and columns:
+                name += f' · {len(columns)} 列统一任务'
             item = QListWidgetItem(name + '\n' + self._cloud_result_text(result))
             item.setToolTip(self._redact(result.get('summary') or self._cloud_result_text(result)))
             self.cloud_result_list.addItem(item)
@@ -1530,6 +1725,18 @@ class FinanceAIPage(QWidget):
         ]
         if record.get('rule_summary'):
             lines.append('处理规则：' + str(record['rule_summary']))
+        columns = record.get('columns')
+        if isinstance(columns, list) and columns:
+            lines.append('\n全部列对应和处理结果：')
+            for column in columns[:30]:
+                if not isinstance(column, dict):
+                    continue
+                target = str(column.get('target_column', ''))
+                source = str(column.get('source_field', ''))
+                lines.append(f'• {target}' + (f' ← {source}' if source else ''))
+                lines.append('  ' + FinanceAIPage._cloud_result_text(column))
+                if column.get('summary'):
+                    lines.append('  ' + str(column['summary']))
         current = record.get('current_check')
         if isinstance(current, dict):
             lines.append('本次核对：' + '；'.join(f'{label} {current.get(key, 0)} 项' for key, label in (
@@ -1555,6 +1762,8 @@ class FinanceAIPage(QWidget):
                     continue
                 key = change.get('key_values', [])
                 key_text = ' / '.join(str(value) for value in key) if isinstance(key, list) else str(key)
+                if isinstance(change.get('target_column'), str) and change['target_column']:
+                    key_text += ' · ' + change['target_column']
                 status = change.get('status', '')
                 explanation = status_names.get(status, status)
                 before = change.get('old_value', '')
@@ -1584,12 +1793,14 @@ class FinanceAIPage(QWidget):
                     continue
                 try:
                     record = json.loads(path.read_text(encoding='utf-8'))
-                    if not isinstance(record, dict) or record.get('schema') != 1 or not isinstance(record.get('task_id'), str):
+                    if (not isinstance(record, dict) or type(record.get('schema')) is not int
+                            or record['schema'] not in (1, 2) or not isinstance(record.get('task_id'), str)
+                            or record.get('parent_task_id')):
                         continue
                     normalize_share_url(record.get('document_url', ''))
                     result = {key: record[key] for key in ('task_id', 'document_url', 'document_name', 'sheet',
                               'status', 'summary', 'updated', 'unchanged', 'skipped', 'conflicts', 'unknown',
-                              'current_check') if key in record}
+                              'current_check', 'final_check', 'columns', 'kind', 'last_action') if key in record}
                     result['details_path'] = str(path.resolve())
                     records.append(result)
                 except (WpsError, ValueError, OSError, TypeError):

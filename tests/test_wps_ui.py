@@ -376,7 +376,7 @@ def test_explicit_task_check_resolves_bound_document_without_old_write_scope(pag
 
 
 @pytest.mark.parametrize('record', [None, '{broken', {'schema': 1, 'task_id': 'wrong', 'document_url': URL},
-                                  {'schema': 2, 'task_id': 'b2' * 16, 'document_url': URL},
+                                  {'schema': 3, 'task_id': 'b2' * 16, 'document_url': URL},
                                   {'schema': 1, 'task_id': 'b2' * 16, 'document_url': 'file:///private'}])
 def test_invalid_history_check_stops_before_ai_or_upload(page_factory, app, tmp_path, record):
     page = page_factory()

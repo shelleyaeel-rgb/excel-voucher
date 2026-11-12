@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 import threading
 import time
+from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -253,6 +254,38 @@ def test_cancellation_keeps_uploaded_files_and_records_uncertain_usage(page_fact
     assert page.ledger.summary()['requests'] == 2
 
 
+@pytest.mark.parametrize('discard_partial', [True, False])
+def test_mapping_gate_error_discards_only_current_stream_and_keeps_cloud_records(page_factory, app, discard_partial):
+    record = {'task_id': 'd' * 32, 'document_url': 'https://www.kdocs.cn/l/testMapping',
+              'document_name': '模板.xlsx', 'sheet': '私户', 'status': 'partial',
+              'updated': 2, 'unknown': 0, 'conflicts': 1, 'summary': '已核对 2 格，另有冲突。'}
+
+    class GateClient(OfflineClient):
+        def send(self, message, files, history, **kwargs):
+            kwargs['on_text']('全部已经更新成功。')
+            error = AIError('尚未选择全部列对应，请先逐行选择。')
+            if discard_partial:
+                error.discard_partial_text = True
+            error.cloud_results = [dict(record)]
+            raise error
+
+    page = page_factory(client_factory=GateClient)
+    previous = [('user', '上一次核对结果是什么？'), ('assistant', '上一次的真实结果已记录。')]
+    page.messages = list(previous)
+    page.history = [{'role': role, 'content': text} for role, text in previous]
+    page.message_edit.setPlainText('更新本次流水')
+    page.send_message()
+    pump(app, lambda: not page.is_busy)
+    assert page.messages[:2] == previous
+    assert page.history == [{'role': role, 'content': text} for role, text in previous]
+    assert (('assistant', '全部已经更新成功。') in page.messages) is (not discard_partial)
+    assert page.messages[-1][0] == 'notice' and '尚未选择全部列对应' in page.messages[-1][1]
+    assert page.cloud_result_list.count() == 1 and page.cloud_results[0]['updated'] == 2
+    if discard_partial:
+        assert page._partial_text == ''
+        assert '全部已经更新成功。' not in page.transcript.toPlainText()
+
+
 def test_budget_blocks_new_request_before_client_creation(page_factory):
     page = page_factory(settings=AISettings(api_key='fake', monthly_limit_usd=1))
     page.ledger.record(0, 2_000_000)
@@ -368,6 +401,293 @@ def test_chat_resources_cannot_load_local_files(page_factory, monkeypatch):
     page.transcript._open_link(QUrl('file:///bad.exe'))
     page.transcript._open_link(QUrl('https://example.test/reference'))
     assert opened == ['https://example.test/reference']
+
+
+def mapping_question():
+    return {'kind': 'mapping', 'question': '请一次确认全部列对应', 'sheet': '私户', 'options': [],
+            'document_url': 'https://www.kdocs.cn/l/testMapping', 'mappings': [
+                {'target_column': '日期', 'source_options': ['交易日期'], 'selected_source': '交易日期',
+                 'note': '保留日期格式'},
+                {'target_column': '对方账户', 'source_options': ['对方户名', '对方账号'], 'selected_source': None,
+                 'note': '请选择需要显示的内容'},
+                {'target_column': '收入', 'source_options': ['交易金额中的正数'],
+                 'selected_source': '交易金额中的正数', 'note': '负数填写到支出，取绝对值'},
+                {'target_column': '备注', 'source_options': ['摘要'], 'selected_source': '摘要',
+                 'note': '空白保留原值'},
+            ]}
+
+
+def select_mapping_sources(page, sources=None):
+    sources = sources or ['交易日期', '对方户名', '交易金额中的正数', '摘要']
+    for combo, source in zip(page._mapping_inputs, sources):
+        combo.setCurrentText(source)
+
+
+class PendingMappingBackend:
+    """UI contract double: only explicitly edited user drafts survive a turn."""
+    def __init__(self, question=None):
+        self.question = deepcopy(question or mapping_question())
+        self.question.update(mapping_id='mapping-one', scope_id='scope-one', user_selections={})
+        self.questions = [deepcopy(self.question)]
+        self.invalidated = []
+
+    def pending_mapping_questions(self):
+        return [deepcopy(self.question)] if self.question else []
+
+    def update_mapping_draft(self, mapping_id, selections):
+        if self.question is None or self.question['mapping_id'] != mapping_id:
+            raise ValueError('过期')
+        self.question['user_selections'] = dict(selections)
+
+    def invalidate_mapping(self, reason):
+        self.invalidated.append(reason)
+        self.question = None
+
+
+def test_mapping_form_requires_all_choices_and_submits_once(page_factory, monkeypatch):
+    page = page_factory()
+    page._cloud_tools = SimpleNamespace(questions=[mapping_question()])
+    sent = []
+    monkeypatch.setattr(page, 'send_message', lambda: sent.append(page.message_edit.toPlainText()))
+    page._show_cloud_questions()
+    assert not page.question_scroll.isHidden()
+    assert len(page._mapping_inputs) == 4 and len(page._clarification_buttons) == 1
+    assert all(combo.currentText() == '' for combo in page._mapping_inputs)
+    page._clarification_buttons[0].click()
+    assert not sent
+    page._mapping_inputs[1].setCurrentText('对方户名')
+    page._clarification_buttons[0].click()
+    assert not sent  # One choice cannot silently accept the other AI recommendations.
+    select_mapping_sources(page)
+    fields = page._mapping_forms[0]['fields']
+    page._clarification_buttons[0].click()
+    assert len(sent) == 1
+    assert sent[0].startswith('针对“请一次确认全部列对应”：')
+    for text in ('“日期” ← “交易日期”', '“对方账户” ← “对方户名”', '“收入” ← “交易金额中的正数”',
+                 '“备注” ← “摘要”'):
+        assert text in sent[0]
+    assert '空白保留原值' not in sent[0]  # AI notes are not new user instructions.
+    page._sync_controls()
+    page._clarification_buttons[0].click()
+    page._answer_mapping('请一次确认全部列对应', '私户', fields)
+    assert len(sent) == 1  # A consumed form cannot issue a second confirmation.
+
+
+def test_mapping_supports_typing_existing_source_busy_disable_and_clear(page_factory, monkeypatch):
+    page = page_factory()
+    page._cloud_tools = SimpleNamespace(questions=[mapping_question()])
+    sent = []
+    monkeypatch.setattr(page, 'send_message', lambda: sent.append(page.message_edit.toPlainText()))
+    page._show_cloud_questions()
+    select_mapping_sources(page)
+    page._mapping_inputs[1].setEditText('自定义户名字段')
+    page._clarification_buttons[0].click()
+    assert not sent and '来源不在候选列表' in page.status_label.text()
+    page._mapping_inputs[1].setEditText('对方账号')
+    fields = page._mapping_forms[0]['fields']
+    page._job = SimpleNamespace(cancel=threading.Event())
+    page._sync_controls()
+    assert all(not field.isEnabled() for field in page._mapping_inputs)
+    assert all(not button.isEnabled() for button in page._mapping_choice_buttons)
+    assert not page._clarification_buttons[0].isEnabled()
+    page._answer_mapping('请一次确认全部列对应', '私户', fields)
+    assert not sent
+    page._job = None
+    page._sync_controls()
+    page._clarification_buttons[0].click()
+    assert '对方账号' in sent[0]
+    page._clear_cloud_questions()
+    assert not page._mapping_forms and not page._mapping_inputs
+    assert not page._mapping_choice_buttons
+    assert not page._clarification_buttons and page.question_scroll.isHidden()
+
+
+def test_mapping_choose_button_opens_candidates_and_picks_a_source(page_factory, app):
+    page = page_factory()
+    page._cloud_tools = SimpleNamespace(questions=[mapping_question()])
+    page.resize(1200, 850)
+    page._show_cloud_questions()
+    page.show()
+    app.processEvents()
+    combo = page._mapping_inputs[1]
+    choose = page._mapping_choice_buttons[1]
+    page.question_scroll.ensureWidgetVisible(choose)
+    QTest.mouseClick(choose, Qt.MouseButton.LeftButton)
+    app.processEvents()
+    assert combo.view().isVisible()
+    index = combo.model().index(1, 0)
+    QTest.mouseClick(combo.view().viewport(), Qt.MouseButton.LeftButton,
+                     pos=combo.view().visualRect(index).center())
+    app.processEvents()
+    assert combo.currentText() == '对方账号'
+    assert not combo.view().isVisible()
+
+
+def test_mapping_lists_all_actual_sources_and_keeps_user_skip(page_factory, monkeypatch):
+    from xiaoyu.cloud_mapping import KEEP_SOURCE
+    page = page_factory()
+    question = mapping_question()
+    question['mappings'][0].update(source_options=[f'源字段{i:03d}' for i in range(300)] + [KEEP_SOURCE],
+                                   selected_source='源字段001')
+    page._cloud_tools = PendingMappingBackend(question)
+    sent = []
+    monkeypatch.setattr(page, 'send_message', lambda: sent.append(page.message_edit.toPlainText()))
+    page._show_cloud_questions()
+    assert all(combo.currentText() == '' for combo in page._mapping_inputs)
+    assert page._mapping_inputs[0].count() == 301
+    assert page._mapping_inputs[0].findText('源字段299') >= 0
+    select_mapping_sources(page, ['源字段299', '对方户名', KEEP_SOURCE, KEEP_SOURCE])
+    page._show_cloud_questions()  # An ordinary redraw restores only actual user choices.
+    assert [combo.currentText() for combo in page._mapping_inputs] == [
+        '源字段299', '对方户名', KEEP_SOURCE, KEEP_SOURCE]
+    page._clarification_buttons[0].click()
+    assert '“收入” ← “保留不更新”' in sent[0]
+    assert '“备注” ← “保留不更新”' in sent[0]
+
+
+def test_pending_mapping_and_partial_user_choices_survive_other_question(page_factory):
+    page = page_factory()
+    backend = PendingMappingBackend()
+    page._cloud_tools = backend
+    page._show_cloud_questions()
+    page._mapping_inputs[1].setCurrentText('对方账号')
+    backend.questions = [{'question': '只处理本月流水吗？', 'options': ['只处理本月', '全部流水']}]
+    page._show_cloud_questions()
+    assert len(page._mapping_forms) == 1 and len(page._clarification_buttons) == 3
+    assert [combo.currentText() for combo in page._mapping_inputs] == ['', '对方账号', '', '']
+
+
+def test_expired_mapping_and_changed_attachment_cannot_reuse_selection(page_factory, monkeypatch, tmp_path):
+    page = page_factory()
+    backend = PendingMappingBackend()
+    page._cloud_tools = backend
+    sent = []
+    monkeypatch.setattr(page, 'send_message', lambda: sent.append(page.message_edit.toPlainText()))
+    page._show_cloud_questions()
+    select_mapping_sources(page)
+    fields = page._mapping_forms[0]['fields']
+    source = tmp_path / 'different.csv'
+    source.write_text('amount\n42\n', encoding='utf-8')
+    page.add_paths([source])
+    assert backend.invalidated == ['来源文件已变化']
+    assert not page._mapping_forms
+    page._answer_mapping('请一次确认全部列对应', '私户', fields)
+    page._show_cloud_questions()
+    assert not sent and not page._mapping_inputs
+    backend.question = dict(mapping_question(), mapping_id='mapping-two', scope_id='scope-two', user_selections={})
+    page._show_cloud_questions()
+    assert all(combo.currentText() == '' for combo in page._mapping_inputs)
+    page.attachment_list.setCurrentRow(0)
+    page.remove_selected_file()
+    assert backend.invalidated == ['来源文件已变化', '来源文件已变化']
+    assert not page._mapping_forms
+
+
+def test_backend_scope_change_rejects_still_visible_mapping(page_factory, monkeypatch):
+    page = page_factory()
+    backend = PendingMappingBackend()
+    page._cloud_tools = backend
+    sent = []
+    monkeypatch.setattr(page, 'send_message', lambda: sent.append(page.message_edit.toPlainText()))
+    page._show_cloud_questions()
+    select_mapping_sources(page)
+    backend.invalidate_mapping('任务要求已变化')
+    page._clarification_buttons[0].click()
+    assert not sent and not page._mapping_forms
+    assert '列对应已失效' in page.status_label.text()
+
+
+def test_invalid_mapping_is_not_displayed_and_markup_stays_plain(page_factory):
+    page = page_factory()
+    question = mapping_question()
+    question['mappings'][0]['target_column'] = '<b>日期</b>'
+    question['mappings'][0]['note'] = '<img src="file:///private.png">'
+    page._cloud_tools = SimpleNamespace(questions=[question])
+    page._show_cloud_questions()
+    assert len(page._mapping_inputs) == 4
+    assert page._mapping_inputs[0].accessibleName() == '<b>日期</b>的来源字段'
+    question['mappings'][1]['source_options'] = []
+    page._show_cloud_questions()
+    assert not page._mapping_inputs and page.question_scroll.isHidden()
+
+
+def test_markdown_mapping_table_remains_one_complete_table(page_factory):
+    page = page_factory()
+    pairs = [('日期', '交易日期'), ('对方账户', '对方户名'), ('收入', '正数金额'),
+             ('支出', '负数取绝对值'), ('余额', '保留原公式'), ('备注', '摘要')]
+    markdown = '| 云表目标列 | 银行流水来源 |\n| --- | --- |\n' + '\n'.join(
+        f'| {target} | {source} |' for target, source in pairs)
+    page.messages = [('assistant', markdown)]
+    page._render_chat()
+    tables = [frame for frame in page.transcript.document().rootFrame().childFrames()
+              if hasattr(frame, 'cellAt')]
+    assert len(tables) == 1
+    table = tables[0]
+    assert table.rows() == 7 and table.columns() == 2
+    for row, pair in enumerate(pairs, 1):
+        for column, expected in enumerate(pair):
+            cell = table.cellAt(row, column)
+            cursor = cell.firstCursorPosition()
+            cursor.setPosition(cell.lastCursorPosition().position(), QTextCursor.MoveMode.KeepAnchor)
+            assert cursor.selectedText() == expected
+
+
+def test_group_task_displays_one_record_and_per_column_status(page_factory):
+    page = page_factory()
+    base = {'task_id': 'a' * 32, 'schema': 2, 'kind': 'table_update',
+            'document_url': 'https://www.kdocs.cn/l/testMapping', 'document_name': '模板.xlsx',
+            'sheet': '私户', 'status': 'partial', 'updated': 16, 'unchanged': 0,
+            'skipped': 0, 'unknown': 0, 'conflicts': 1, 'summary': '部分完成',
+            'columns': [
+                {'target_column': '日期', 'source_field': '交易日期', 'status': 'completed', 'updated': 16},
+                {'target_column': '收入', 'source_field': '正数金额', 'status': 'partial', 'conflicts': 1},
+            ], 'items': [{'key_values': ['001'], 'target_column': '日期', 'status': 'verified',
+                         'old_value': '', 'new_value': '2026-11-10'}]}
+    child = dict(base, task_id='b' * 32, parent_task_id=base['task_id'])
+    page._record_cloud_results([child, base])
+    assert page.cloud_result_list.count() == 1
+    assert '2 列统一任务' in page.cloud_result_list.item(0).text()
+    details = page._format_cloud_details(base)
+    assert '日期 ← 交易日期' in details and '收入 ← 正数金额' in details
+    assert '已核对完成' in details and '部分完成' in details
+    assert '001 · 日期' in details
+
+
+def test_group_final_check_is_not_described_as_historical(page_factory):
+    page = page_factory()
+    result = {'status': 'completed', 'updated': 64, 'unknown': 0, 'conflicts': 0,
+              'final_check': {'checked': 64, 'matched': 64, 'changed': 0, 'missing': 0,
+                              'duplicate': 0, 'failed': False}}
+    result['current_check'] = dict(result['final_check'])
+    assert '全部列已核对完成' in page._cloud_result_text(result)
+    assert '历史' not in page._cloud_result_text(result)
+    result['unknown'] = 1
+    assert '结果待核对' in page._cloud_result_text(result)
+    result['unknown'] = 0
+    result['last_action'] = 'check'
+    result['current_check'].update(changed=1, matched=63)
+    assert '历史更新已完成' in page._cloud_result_text(result)
+    assert '当前有 1 项不同' in page._cloud_result_text(result)
+
+
+def test_history_accepts_v2_groups_and_legacy_records_hides_children(page_factory, tmp_path):
+    import json
+    root = tmp_path / 'cloud-history'
+    root.mkdir()
+    page = page_factory(cloud_journal_dir=root)
+    common = {'document_url': 'https://www.kdocs.cn/l/testMapping', 'document_name': '模板.xlsx',
+              'sheet': '私户', 'status': 'completed', 'summary': '完成', 'updated': 16}
+    for task, fields in [
+        ('a' * 32, {'schema': 1}), ('b' * 32, {'schema': 2}),
+        ('c' * 32, {'schema': 2, 'kind': 'table_update', 'columns': [{'target_column': '日期'}]}),
+        ('d' * 32, {'schema': 2, 'parent_task_id': 'c' * 32}),
+    ]:
+        (root / (task + '.json')).write_text(json.dumps(dict(common, task_id=task, **fields)), encoding='utf-8')
+    page.show_cloud_history()
+    assert page.cloud_result_list.count() == 3
+    assert {r['task_id'] for r in page.cloud_results} == {'a' * 32, 'b' * 32, 'c' * 32}
+    links, historical = page._requested_cloud_links('核对任务编号 ' + 'c' * 32)
+    assert historical and links == [common['document_url']]
 
 
 def test_session_only_key_never_saved_to_settings(page_factory, monkeypatch):

@@ -8,6 +8,7 @@ import io
 import json
 
 from xiaoyu.cloud_tools import CloudDocumentTools
+from mapping_test_support import confirm_columns
 from xiaoyu.wps_service import WpsClient
 
 from test_wps_service import binding, run_script, SHARE
@@ -77,6 +78,8 @@ def read_table(tools):
 
 
 def prepare(tools, snapshot_id, updates=None, *, allow_blank=False):
+    confirmed = confirm_columns(tools, {"snapshot_id": snapshot_id}, [{"target_column": "结果", "source_field": "来源结果"}])
+    snapshot_id = confirmed["snapshot_id"]
     prepared = tools.execute("wps_prepare_update", dict(snapshot_id=snapshot_id, key_columns=["单号"], target_column="结果",
                                                         updates=updates if updates is not None else [dict(key_values=["001"], new_value="新值", reason="符合本次条件")],
                                                         allow_blank=allow_blank, summary="按单号匹配，仅更新符合条件的结果"))

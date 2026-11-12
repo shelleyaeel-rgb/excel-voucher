@@ -38,7 +38,7 @@ SUPPORTED_EXTENSIONS = frozenset({".xlsx", ".csv", ".pdf", ".docx", ".pptx", ".t
 DOWNLOAD_EXTENSIONS = SUPPORTED_EXTENSIONS | {".xls", ".zip"}
 NETWORK_TIMEOUT = 45
 MAX_REQUEST_SECONDS = 300
-MAX_TOOL_ROUNDS = 12
+MAX_TOOL_ROUNDS = 24  # Allow source analysis, clarification, a table plan and final verification.
 MAX_FUNCTION_CALLS = 32
 MAX_TOOL_ARGUMENT_BYTES = 2 * 1024 * 1024
 MAX_TOOL_CONTEXT_BYTES = 12 * 1024 * 1024
@@ -61,6 +61,18 @@ FINANCE_INSTRUCTIONS = """你是“给小雨的软件”中的财务 AI 助手�
 优先按表头、业务编号和筛选条件定位，不要求用户必须提供行号；只在范围或匹配方式不明确时提问。
 上传来源表仍用云端 python 实际读取和计算；不要编造来源数据、目标单元格旧值或工具执行结果。
 先读取云表，再生成修改清单，规则明确时执行；用户说先预览时只预览，未匹配、冲突和部分成功均需说明。
+每次新的云表更新都必须先实际读取目标表和来源表；匹配方式、筛选、正负拆分等业务规则不清时先问清，
+再调用列对应确认工具，按目标列逐行展示来源列选择，避免确认后又补问规则而要求重新选择。
+即使你认为对应关系明确或用户在需求中写过，也不能跳过选择表；每个待更新目标列初始留空，由用户自己选择。
+来源候选提供实际读取的来源表完整列目录，不只给你推荐的几个字段；多文件或同名列注明所属文件、工作表。
+日期转换、正负拆分等规则写在说明中，来源字段名称保持与选择项一致。用户可选“保留不更新”。
+必须等用户在完整列表中逐行选好并点击确认，随后才生成一个完整多列任务。已确认的同一任务不重复问。
+未确认、换附件、换目标或改变对应关系时，软件会拒绝写入；不能改用其他工具或新计划绕过。
+多列更新由软件自动分批执行及整体核对，不要求用户逐列发送要求，不声称WPS只能更新一列。
+先查看哪些目标是公式列，公式列另行说明保留，不加入待选择目标，不把来源余额等字段覆盖目标公式。
+用于更新的读取只包含匹配键、待更新列和真正参与筛选的列；不要仅为展示而加入会随写入重算的公式列。
+只更新用户指定且符合筛选、匹配规则的单元格。
+历史任务完成只说明当时写入并核对成功；当前内容可能被人工清空或改动，应区分历史结果与本次读取结果。
 生成后重新打开检查文件可读、行数及金额合计；关键金额给出可读数值，避免仅写入未计算公式。
 生成文件后给出实际文件引用供下载。没有成功生成或无法验证的内容要明确说明。
 财税结论应确认地区、期间、主体类型等必要条件；最新政策需要官方来源及日期。
@@ -552,6 +564,11 @@ class FinanceAIClient:
         A later summarization failure must never hide a completed cloud write.
         """
         try:
+            set_sources = getattr(cloud_tools, "set_source_context", None)
+            if callable(set_sources):
+                # send() receives the complete, successfully uploaded file list.
+                # A pending local upload is not yet a confirmed source identity.
+                set_sources([{"file_id": file.file_id, "name": file.name, "size": file.size} for file in files])
             definitions = cloud_tools.tool_definitions()
             extra_instructions = cloud_tools.instructions()
             initial_results = getattr(cloud_tools, "results", [])
@@ -584,6 +601,15 @@ class FinanceAIClient:
         call_cache = {}
         call_count = 0
         result_offset = len(initial_results)
+        required_tool = None
+
+        def mapping_error(message):
+            error = AIError(message, request_may_be_billed=True)
+            # Text deltas may already have reached the UI before a completed
+            # response reveals that the required form was not produced.
+            error.discard_partial_text = True
+            aggregate.text = ""
+            return error
 
         def snapshot_results():
             results = getattr(cloud_tools, "results", [])
@@ -599,6 +625,11 @@ class FinanceAIClient:
         try:
             for round_index in range(MAX_TOOL_ROUNDS):
                 _check_cancel(cancel, round_index > 0)
+                forced_for_response = required_tool
+                if required_tool:
+                    payload["tool_choice"] = {"type": "function", "name": required_tool}
+                else:
+                    payload.pop("tool_choice", None)
                 try:
                     body = json.dumps(payload, ensure_ascii=False, allow_nan=False).encode("utf-8")
                 except (TypeError, ValueError, RecursionError):
@@ -633,6 +664,8 @@ class FinanceAIClient:
                 aggregate.text = result.text
                 aggregate.cloud_results = snapshot_results()
                 if not result.function_calls:
+                    if forced_for_response:
+                        raise mapping_error("列对应选择尚未准备完成，本轮已停止，请查看已有任务记录。")
                     return aggregate
                 # Include reasoning, messages and hosted-tool items in order;
                 # store:false cannot rely on a stored previous_response_id.
@@ -644,6 +677,8 @@ class FinanceAIClient:
                     if (not isinstance(call_id, str) or not _ID.fullmatch(call_id)
                             or not isinstance(name, str) or name not in schemas):
                         raise AIError("AI 请求了未提供的云文档操作，已停止执行。", request_may_be_billed=True)
+                    if forced_for_response and name != forced_for_response:
+                        raise mapping_error("尚未完成列对应选择，不能继续其他云文档操作。")
                     arguments, fingerprint = _tool_arguments(call.get("arguments"), schemas[name])
                     cached = call_cache.get(call_id)
                     if cached is not None:
@@ -669,10 +704,25 @@ class FinanceAIClient:
                                           request_may_be_billed=True) from None
                         call_cache[call_id] = ((name, fingerprint), output)
                         aggregate.cloud_results = snapshot_results()
+                    tool_result = json.loads(output)
+                    if name == "wps_confirm_mapping" and tool_result.get("ok") is not True:
+                        # An invalid form may need another real table read; the
+                        # write gate remains closed while the model corrects it.
+                        required_tool = None
+                    if tool_result.get("required_action") == "wps_confirm_mapping":
+                        if "wps_confirm_mapping" not in schemas:
+                            raise mapping_error("缺少列对应选择功能，请重新打开新版软件。")
+                        required_tool = "wps_confirm_mapping"
                     if call_id not in emitted:
                         payload["input"].append({"type": "function_call_output", "call_id": call_id,
                                                  "output": output})
                         emitted.add(call_id)
+                    if (name == "wps_confirm_mapping" and tool_result.get("ok") is True
+                            and tool_result.get("status") == "needs_user_input"):
+                        # Display the application-owned form immediately. Do not
+                        # wait for another model narration or execute later calls.
+                        aggregate.text = "请在下方按目标列逐行选择来源列，全部选好后点击“确认全部列对应”。确认前不会开始本次更新。"
+                        return aggregate
             raise AIError("本次云文档处理达到步骤上限，已停止；请查看任务记录中的已完成部分。",
                           request_may_be_billed=True)
         except AIError as exc:

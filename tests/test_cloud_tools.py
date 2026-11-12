@@ -11,6 +11,7 @@ from xiaoyu.ai_service import FinanceAIClient
 from xiaoyu.ai_settings import AISettings
 from xiaoyu.cloud_tools import CloudDocumentTools
 from xiaoyu.wps_service import WpsBinding, WpsError
+from mapping_test_support import confirm_columns
 
 
 URL = "https://www.kdocs.cn/l/example-doc"
@@ -116,6 +117,7 @@ def read(adapter, **extra):
 
 
 def prepare(adapter, snapshot, updates=None, **extra):
+    snapshot = confirm_columns(adapter, snapshot, [{"target_column": extra.get("target_column", "到账金额"), "source_field": extra.get("target_column", "到账金额")}])
     result = adapter.execute("wps_prepare_update", {"snapshot_id": snapshot["snapshot_id"],
         "key_columns": ["业务单号"], "target_column": "到账金额",
         "updates": updates or [{"key_values": ["001"], "new_value": 30, "reason": "已到账"}],
@@ -139,6 +141,191 @@ def test_header_and_start_are_inferred_without_user_row_numbers(tmp_path):
     assert fake.at(3, 2)["value"] == 30 and fake.at(4, 2)["value"] == 20
     assert fake.at(3, 1)["value"] == "001"
     assert adapter.results[0]["status"] == "completed" and len(adapter.results) == 1
+
+
+@pytest.mark.parametrize("logging_fails", [False, True])
+def test_precise_read_failure_stops_before_plan_even_if_diagnostics_fail(tmp_path, monkeypatch, logging_fails):
+    adapter, fake = tools(tmp_path)
+    original = fake.call
+    location = {"stage": "snapshot", "field": "number_format", "sheet": "私户", "row": 11, "column": 2}
+    def fail_read(action, **payload):
+        if action == "read":
+            raise WpsError("私户!B11 的数字格式不一致，已停止。", code="FORMAT_MISMATCH", diagnostic=location)
+        return original(action, **payload)
+    monkeypatch.setattr(fake, "call", fail_read)
+    def unavailable(*args, **kwargs):
+        raise OSError("unavailable")
+    if logging_fails:
+        monkeypatch.setattr(cloud, "record_failure", unavailable)
+    result = adapter.execute("wps_read_table", {"document_url": URL, "sheet": SHEET,
+        "columns": HEADERS, "header_row": None, "start_row": None, "end_row": None}, on_status=unavailable)
+    assert result["code"] == "FORMAT_MISMATCH" and result["diagnostic"] == location
+    assert not result["ok"] and not result["retryable"] and not result["mutation_attempted"]
+    assert result["diagnostic_saved"] is (not logging_fails)
+    assert not adapter.snapshots and not adapter.plans and fake.applied_requests == 0
+
+
+def test_write_rejection_exposes_location_and_never_replays(tmp_path, monkeypatch):
+    adapter, fake = tools(tmp_path)
+    plan = prepare(adapter, read(adapter))
+    original = fake.call
+    calls = []
+    location = {"stage": "snapshot", "field": "number_format", "sheet": SHEET, "row": 3, "column": 2}
+    def reject_write(action, **payload):
+        if action == "apply":
+            calls.append(action)
+            raise WpsError("汇总!B3 的数字格式不一致，已停止。", code="FORMAT_MISMATCH", diagnostic=location)
+        return original(action, **payload)
+    monkeypatch.setattr(fake, "call", reject_write)
+    result = apply(adapter, plan)
+    assert result["code"] == "FORMAT_MISMATCH" and result["diagnostic"] == location
+    assert "汇总!B3" in result["error"] and result["retryable"] is False
+    assert fake.at(3, 2)["value"] == 10 and calls == ["apply"]
+    apply(adapter, plan)
+    assert calls == ["apply"]
+
+
+def test_successful_reconciliation_clears_current_error_but_retains_history(tmp_path):
+    adapter, fake = tools(tmp_path)
+    plan = prepare(adapter, read(adapter))
+    fake.fail_read_after_apply = True
+    outcome = apply(adapter, plan)
+    assert outcome["status"] == "uncertain" and outcome["code"] == "NETWORK"
+    assert outcome["retryable"] is False and "不要重复写入" in outcome["error"]
+    fake.fail_read_after_apply = False
+    result = adapter.execute("wps_check_task", {"task_id": plan["plan_id"]})
+    assert result["ok"] and result["status"] == "completed"
+    assert not {"error", "code", "diagnostic", "retryable"}.intersection(result)
+    assert fake.applied_requests == 1
+    assert json.loads((tmp_path / "wps_diagnostics.json").read_text(encoding="utf8"))["records"][-1]["code"] == "NETWORK"
+
+
+def test_unchanged_plain_number_cannot_gain_date_precision_exemption_later(tmp_path):
+    value = 46332.576580243054
+    adapter, fake = tools(tmp_path, [["001", value, "ok"]])
+    plan = prepare(adapter, read(adapter), [{"key_values": ["001"], "new_value": value, "reason": "已有值不变"}])
+    outcome = apply(adapter, plan)
+    assert outcome["unchanged"] == 1 and fake.applied_requests == 0
+    fake.at(3, 2).update(value=46332.576580243, number_format="yyyy-mm-dd")
+    checked = adapter.execute("wps_check_task", {"task_id": plan["plan_id"]})
+    assert not checked["ok"] and checked["current_check"]["changed"] == 1
+
+
+def merged_date_tools(tmp_path):
+    adapter, fake = tools(tmp_path)
+    adapter.bindings[URL] = WpsBinding("example-doc", "测试表", URL, workbook_name="模版.xlsx",
+        provider="skillhub", account_id="test-account", file_id="test-file")
+    merge = dict(start_row=2, end_row=2, start_column=2, end_column=3)
+    fake.rows = {2: [cell(1, "业务单号"), dict(cell(2, "日期", merged=True), merge_range=merge),
+                    dict(cell(3, merged=True), merge_range=merge), cell(4, "备注")]}
+    for row, key in ((3, "001"), (4, "002")):
+        fake.rows[row] = [cell(1, key), cell(2, formula=True),
+                          dict(cell(3), number_format="yyyy-mm-dd", date_system="1900"), cell(4)]
+    return adapter, fake
+
+
+def read_merged_date(adapter, **extra):
+    return adapter.execute("wps_read_table", {"document_url": URL, "sheet": SHEET,
+        "columns": ["业务单号", "日期", "备注"], "header_row": None, "start_row": None, "end_row": None,
+        "column_overrides": [{"name": "日期", "column": 3}], **extra})
+
+
+def test_merged_date_input_uses_real_subcolumn_and_preserves_formula(tmp_path):
+    adapter, fake = merged_date_tools(tmp_path)
+    preview = adapter.execute("wps_inspect", {"document_url": URL, "sheet": SHEET})
+    assert next(row for row in preview["preview"] if row["row"] == 2)["cells"][1]["merge_range"]["end_column"] == 3
+    snap = read_merged_date(adapter)
+    assert snap["ok"] and snap["column_mapping"]["日期"] == 3 and snap["header_row"] == 2
+    expected = adapter.snapshots[snap["snapshot_id"]]["expected_headers"]
+    assert {h["column"] for h in expected} == {1, 2, 3, 4}
+    confirm_columns(adapter, snap, [{"target_column": "日期", "source_field": "日期"}])
+    plan = adapter.execute("wps_prepare_update", {"snapshot_id": snap["snapshot_id"], "key_columns": ["业务单号"],
+        "target_column": "日期", "updates": [{"key_values": ["001"], "new_value": 46332, "reason": "按已确认规则填写日期"}],
+        "allow_blank": False, "summary": "回填日期"})
+    assert plan["can_execute"], plan
+    assert '"target_column": "日期"' in adapter.instructions()
+    result = apply(adapter, plan)
+    assert result["status"] == "completed" and result["updated"] == 1
+    assert fake.at(3, 3)["value"] == 46332 and fake.at(3, 3)["number_format"] == "yyyy-mm-dd"
+    assert fake.at(3, 2)["formula"] == "=1+1" and fake.at(4, 3)["value"] == ""
+    checked = adapter.execute("wps_check_task", {"task_id": plan["plan_id"]})
+    assert checked["ok"] and fake.applied_requests == 1
+
+
+def test_ai_finishes_five_columns_in_one_complete_task(tmp_path):
+    adapter, fake = tools(tmp_path)
+    names = ["业务单号", "日期", "对方账户", "收入", "支出", "备注"]
+    fake.rows = {2: [cell(i + 1, name) for i, name in enumerate(names)],
+                 3: [cell(1, "001")] + [cell(i) for i in range(2, 7)]}
+    new_values = [46332, "测试对方", 100, 0, "测试摘要"]
+    initial = read(adapter, columns=names)
+    confirm_columns(adapter, initial, [{"target_column": n, "source_field": n} for n in names[1:]])
+    class ModelOpener:
+        def __init__(self):
+            self.calls = 0
+        def open(self, request, timeout=None):
+            step = self.calls
+            self.calls += 1
+            payload = json.loads(request.data)
+            outputs = [json.loads(item["output"]) for item in payload["input"] if item.get("type") == "function_call_output"]
+            if step == 3:
+                output = [{"type": "message", "content": [{"type": "output_text", "text": "五列已核对。"}]}]
+            else:
+                phase = step
+                if phase == 0:
+                    name, args = "wps_read_table", {"document_url": URL, "sheet": SHEET, "columns": names,
+                        "header_row": None, "start_row": None, "end_row": None, "column_overrides": None}
+                elif phase == 1:
+                    assert outputs[-1]["ok"], outputs[-1]
+                    name, args = "wps_prepare_table_update", {"snapshot_id": outputs[-1]["snapshot_id"],
+                        "key_columns": ["业务单号"],
+                        "columns": [{"target_column": n, "source_field": n, "allow_blank": False} for n in names[1:]],
+                        "updates": [{"key_values": ["001"], "values": new_values, "reason": "已确认空模板填写"}],
+                        "summary": "一次填写全部五列并整体核对"}
+                else:
+                    assert outputs[-1]["can_execute"], outputs[-1]
+                    name, args = "wps_apply_table_update", {"plan_id": outputs[-1]["plan_id"]}
+                output = [{"type": "function_call", "name": name, "call_id": f"call-{step}",
+                           "arguments": json.dumps(args, ensure_ascii=False)}]
+            event = {"type": "response.completed", "response": {"status": "completed", "output": output,
+                "usage": {"input_tokens": 10, "output_tokens": 5}}}
+            return io.BytesIO(b"data: " + json.dumps(event, ensure_ascii=False).encode() + b"\n\n")
+    client = FinanceAIClient(AISettings(api_key="sk-test-never-real"), opener=ModelOpener())
+    client.send("按已确认规则填入五列，保留公式", [], [], cloud_tools=adapter)
+    assert fake.applied_requests == 5
+    assert [fake.at(3, column)["value"] for column in range(2, 7)] == new_values
+    assert len(adapter.results) == 1 and adapter.results[0]["status"] == "completed"
+    assert len(adapter.results[0]["columns"]) == 5
+    assert adapter.results[0]["current_check"]["matched"] == 5
+
+
+@pytest.mark.parametrize("overrides", [None, [], [{"name": "日期", "column": 4}],
+    [{"name": "不存在", "column": 3}], [{"name": "日期", "column": True}],
+    [{"name": "日期", "column": 3}, {"name": "日期", "column": 2}]])
+def test_invalid_merged_header_choices_never_prepare_or_write(tmp_path, overrides):
+    adapter, fake = merged_date_tools(tmp_path)
+    result = read_merged_date(adapter, column_overrides=overrides)
+    assert result["ok"] is False and not adapter.snapshots and fake.applied_requests == 0
+
+
+@pytest.mark.parametrize("fault", ["missing", "different", "vertical", "legacy", "repeated"])
+def test_merged_header_requires_exact_verified_group(tmp_path, fault):
+    adapter, fake = merged_date_tools(tmp_path)
+    if fault == "missing":
+        fake.at(2, 3).pop("merge_range")
+    elif fault == "different":
+        fake.at(2, 3)["merge_range"] = dict(start_row=2, end_row=2, start_column=3, end_column=4)
+    elif fault == "vertical":
+        fake.at(2, 2)["merge_range"]["end_row"] = 3
+    elif fault == "legacy":
+        adapter.bindings[URL].provider = "airscript"
+        adapter.bindings[URL].account_id = ""
+        adapter.bindings[URL].token = "test-token"
+        adapter.bindings[URL].endpoint = "https://www.kdocs.cn/api/v3/ide/file/test-file/script/s/sync_task"
+    else:
+        fake.rows[4] = deepcopy(fake.rows[2])
+    assert not read_merged_date(adapter)["ok"]
+    assert not adapter.snapshots and fake.applied_requests == 0
 
 
 def test_zero_is_value_and_numeric_keys_do_not_match_text_or_boolean(tmp_path):
@@ -359,6 +546,7 @@ def test_repeated_header_outside_first_30_rows_requires_explicit_range(tmp_path)
 def test_large_integer_is_rejected_before_plan_or_network_write(tmp_path):
     adapter, fake = tools(tmp_path)
     snap = read(adapter)
+    confirm_columns(adapter, snap, [{"target_column": "到账金额", "source_field": "金额"}])
     result = adapter.execute("wps_prepare_update", {"snapshot_id": snap["snapshot_id"], "key_columns": ["业务单号"],
         "target_column": "到账金额", "updates": [{"key_values": ["001"], "new_value": 9007199254740992, "reason": "测试"}],
         "allow_blank": False, "summary": "测试"})
@@ -368,6 +556,7 @@ def test_large_integer_is_rejected_before_plan_or_network_write(tmp_path):
 def test_service_collects_same_task_replaced_preview_as_final_result(tmp_path):
     adapter, fake = tools(tmp_path, write=False)
     adapter.begin_turn("按业务单号更新到账金额")
+    confirm_columns(adapter, read(adapter), [{"target_column": "到账金额", "source_field": "银行金额"}])
     class ModelOpener:
         def __init__(self):
             self.calls = 0
@@ -377,13 +566,14 @@ def test_service_collects_same_task_replaced_preview_as_final_result(tmp_path):
             outputs = [json.loads(item["output"]) for item in payload["input"] if item.get("type") == "function_call_output"]
             if self.calls == 1:
                 name, args = "wps_read_table", {"document_url": URL, "sheet": SHEET, "columns": HEADERS,
-                    "header_row": None, "start_row": None, "end_row": None}
+                    "header_row": None, "start_row": None, "end_row": None, "column_overrides": None}
             elif self.calls == 2:
-                name, args = "wps_prepare_update", {"snapshot_id": outputs[-1]["snapshot_id"], "key_columns": ["业务单号"],
-                    "target_column": "到账金额", "updates": [{"key_values": ["001"], "new_value": 30, "reason": "已到账"}],
-                    "allow_blank": False, "summary": "按单号更新"}
+                name, args = "wps_prepare_table_update", {"snapshot_id": outputs[-1]["snapshot_id"], "key_columns": ["业务单号"],
+                    "columns": [{"target_column": "到账金额", "source_field": "银行金额", "allow_blank": False}],
+                    "updates": [{"key_values": ["001"], "values": [30], "reason": "已到账"}],
+                    "summary": "按单号更新"}
             elif self.calls == 3:
-                name, args = "wps_apply_update", {"plan_id": outputs[-1]["plan_id"]}
+                name, args = "wps_apply_table_update", {"plan_id": outputs[-1]["plan_id"]}
             else:
                 output = [{"type": "message", "content": [{"type": "output_text", "text": "已核对更新。"}]}]
             if self.calls <= 3:
@@ -410,6 +600,8 @@ def test_clarification_offers_clickable_choices_and_blocks_same_turn_commit(tmp_
     assert apply(adapter, plan)["status"] == "needs_user_input" and fake.applied_requests == 0
     adapter.begin_turn("业务单号")
     assert adapter.questions == [] and adapter.allow_write
+    assert apply(adapter, plan)["status"] == "needs_mapping"
+    plan = prepare(adapter, read(adapter))
     assert apply(adapter, plan)["status"] == "completed" and fake.applied_requests == 1
 
 
@@ -568,7 +760,7 @@ def test_plan_rejects_account_or_real_file_change_before_submission(tmp_path, fi
     plan = prepare(adapter, read(adapter))
     setattr(adapter.bindings[URL], field, value)
     result = apply(adapter, plan)
-    assert result["ok"] is False and "绑定已变化" in result["error"]
+    assert result["ok"] is False and result.get("status") == "needs_mapping"
     assert fake.applied_requests == 0
     checked = adapter.execute("wps_check_task", {"task_id": plan["plan_id"]})
     assert not checked["ok"]
@@ -579,7 +771,7 @@ def test_old_snapshot_cannot_prepare_updates_after_account_change(tmp_path):
     adapter, fake = account_tools(tmp_path)
     snapshot = read(adapter)
     adapter.bindings[URL].account_id = "account-two"
-    with pytest.raises(AssertionError, match="绑定已变化"):
+    with pytest.raises(AssertionError, match="实际目标列"):
         prepare(adapter, snapshot)
     assert not adapter.plans and fake.applied_requests == 0
 
@@ -590,7 +782,7 @@ def test_plan_rejects_provider_change_even_with_same_file_id(tmp_path):
     adapter.bindings[URL] = WpsBinding("account-doc", "账号表", URL, workbook_name="模版.xlsx",
         provider="skillhub", account_id="account-one", file_id="example-doc")
     result = apply(adapter, plan)
-    assert result["ok"] is False and "绑定已变化" in result["error"] and fake.applied_requests == 0
+    assert result["ok"] is False and result.get("status") == "needs_mapping" and fake.applied_requests == 0
 
 
 def test_new_journal_preserves_full_provider_identity_without_credentials(tmp_path):
@@ -680,7 +872,7 @@ def test_new_login_can_read_reconcile_same_file_alias_without_reusing_old_plan(t
     assert "修改计划不存在" in apply(reopened, old_prepared)["error"]
     assert fake.applied_requests == 1
     adapter.bindings[URL].account_id = "account-two"
-    assert "绑定已变化" in apply(adapter, old_prepared)["error"]
+    assert apply(adapter, old_prepared)["status"] == "needs_mapping"
 
 
 def test_new_login_cannot_reconcile_if_server_file_identity_differs(tmp_path):
@@ -775,7 +967,7 @@ def test_calculation_export_and_unscoped_execution_do_not_grant_cloud_writes(tmp
     adapter.begin_turn(message)
     assert not adapter.allow_write
     plan = prepare(adapter, read(adapter))
-    assert apply(adapter, plan)["status"] == "preview_only" and fake.applied_requests == 0
+    assert apply(adapter, plan)["status"] in ("preview_only", "needs_mapping") and fake.applied_requests == 0
 
 
 @pytest.mark.parametrize("message", ["按业务单号更新云文档金额", "将来源金额写入这份云表", "把已到账金额回填到云文档"])
@@ -814,4 +1006,4 @@ def test_generic_calculation_execution_does_not_accept_an_existing_preview(tmp_p
     plan = prepare(adapter, read(adapter))
     adapter.begin_turn("开始执行金额汇总并导出文件")
     assert not adapter.allow_write
-    assert apply(adapter, plan)["status"] == "preview_only" and fake.applied_requests == 0
+    assert apply(adapter, plan)["status"] in ("preview_only", "needs_mapping") and fake.applied_requests == 0

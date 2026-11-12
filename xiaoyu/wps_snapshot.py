@@ -1,9 +1,9 @@
-"""Read-only XLSX metadata for cells omitted by WPS's sparse range API.
+"""Read-only XLSX formats and date epochs missing from WPS's range API.
 
 The download URL comes from the authorized, public download_file tool. Only
 its short-lived signature is used for the download: no account token, browser
 cookie, redirects, or saved URLs. A version/hash and live-cell cross-check is
-required before a missing cell's format can be trusted.
+required before a missing cell's format or a live date's epoch can be trusted.
 """
 from __future__ import annotations
 
@@ -20,9 +20,10 @@ from datetime import date, datetime, time, timedelta
 from xml.etree import ElementTree
 
 from openpyxl import load_workbook
-from openpyxl.utils.datetime import to_excel
+from openpyxl.utils.cell import get_column_letter
+from openpyxl.utils.datetime import CALENDAR_MAC_1904, CALENDAR_WINDOWS_1900, to_excel
 
-from .wps_service import WpsError
+from .wps_service import WpsError, safe_wps_diagnostic
 
 MAX_DOWNLOAD_BYTES = 20 * 1024 * 1024
 MAX_EXPANDED_BYTES = 64 * 1024 * 1024
@@ -31,17 +32,16 @@ MAX_XLSX_CELLS = 250000
 _ID = re.compile(r"[A-Za-z0-9_-]{1,128}\Z")
 _COLORS = {"黑色": "Black", "蓝色": "Blue", "青色": "Cyan", "绿色": "Green",
            "洋红": "Magenta", "洋红色": "Magenta", "红色": "Red", "白色": "White", "黄色": "Yellow"}
+_GENERAL_TOKENS = ("G/通用格式", "常规", "General")
 
 
 def normalize_number_format(value):
     if not isinstance(value, str) or len(value) > 1024:
         raise WpsError("无法核对云表数字格式。", code="UNSUPPORTED_CELL_METADATA")
-    if value in ("G/通用格式", "常规", "General", "general", "GENERAL"):
-        return "General"
     # WPS drops optional escapes on literal parentheses and minus signs in
     # accounting/date formats. Keep scientific E\- distinct from E-, bracket
     # directives, quoted text, and spacing/repetition tokens unchanged.
-    result, quoted, brackets, index = [], False, 0, 0
+    result, quoted, brackets, index, word = [], False, 0, 0, False
     while index < len(value):
         char = value[index]
         if char in ("\\", "_", "*") and index + 1 < len(value):
@@ -49,26 +49,71 @@ def normalize_number_format(value):
             optional = following in "()" or (following == "-" and (index == 0 or value[index - 1] not in "Ee"))
             result.append(following if char == "\\" and not quoted and not brackets and optional else char + following)
             index += 2
+            word = False
             continue
+        # General is a format token, including in General"月" and separate
+        # conditional sections. Never rewrite quoted text, directives, an
+        # escaped/spacing character, or part of a longer unquoted word.
+        if not quoted and not brackets and not word:
+            token = next((token for token in _GENERAL_TOKENS
+                          if value[index:index + len(token)].casefold() == token.casefold()
+                          and (index + len(token) == len(value)
+                               or not value[index + len(token)].isalnum())), None)
+            if token is not None:
+                result.append("General")
+                index += len(token)
+                word = True
+                continue
         if char == '"':
             quoted = not quoted
+            word = False
         elif not quoted and char == "[":
             end = value.find("]", index + 1)
             color = value[index + 1:end] if end != -1 else ""
             if not brackets and color in _COLORS:
                 result.append("[" + _COLORS[color] + "]")
                 index = end + 1
+                word = False
                 continue
             brackets += 1
+            word = False
         elif not quoted and char == "]":
             brackets = max(0, brackets - 1)
+            word = False
+        elif not quoted and not brackets:
+            word = char.isalnum() or char == "_"
         result.append(char)
         index += 1
     return "".join(result)
 
 
-def _fail(code="SNAPSHOT_CHANGED"):
-    raise WpsError("云表下载副本与当前数据尚未一致，无法核对空白格格式；请稍后重新读取。", code=code)
+def _fail(code="SNAPSHOT_CHANGED", *, sheet=None, coordinate=None, field=None, stage="snapshot"):
+    diagnostic = {"stage": stage, "sheet": sheet, "field": field}
+    if coordinate is not None:
+        diagnostic.update(row=coordinate[0], column=coordinate[1])
+    diagnostic = safe_wps_diagnostic(diagnostic)
+    position = "工作表“" + diagnostic["sheet"] + "”" if "sheet" in diagnostic else "云表"
+    if "row" in diagnostic and "column" in diagnostic:
+        position += "的 " + get_column_letter(diagnostic["column"]) + str(diagnostic["row"])
+    kinds = {"VALUE_MISMATCH": "数据", "TYPE_MISMATCH": "数据类型", "FORMULA_MISMATCH": "公式",
+             "FORMAT_MISMATCH": "单元格格式", "MERGE_MISMATCH": "合并状态"}
+    if code in kinds:
+        message = f"{position}的{kinds[code]}与下载副本不一致，已停止继续处理；请核对该单元格。"
+    else:
+        message = {
+            "SNAPSHOT_CHANGED": "云表文件版本或校验值暂未一致，无法核对空白格格式；请稍后重新读取。",
+            "SNAPSHOT_UNVERIFIED": "没有找到可用于核对的单元格，暂不能确认空白格格式。",
+            "UNSUPPORTED_CELL_METADATA": "暂时无法识别云表的单元格类型或格式，已停止继续处理。",
+            "UNTRUSTED_DOWNLOAD_URL": "WPS 返回的下载地址无法验证，已停止读取。",
+            "REDIRECT_BLOCKED": "WPS 下载地址发生了未预期的跳转，已停止读取。",
+            "DOWNLOAD_FAILED": "下载云表副本失败，请检查网络后重新读取。",
+            "SNAPSHOT_TOO_LARGE": "云表副本超过可读取的文件大小或内容范围，暂不能核验空白格格式。",
+            "INVALID_RESPONSE": "WPS 返回的文件信息不完整，无法继续核验。",
+            "INVALID_SNAPSHOT": "下载副本无法解析或格式不受支持，已停止读取。",
+            "INVALID_ARGUMENTS": "云表核对范围不正确，已停止操作。",
+            "WORKBOOK_MISMATCH": "下载副本对应的文档或工作表已变化，请重新选择文档。",
+        }.get(code, "云表副本核对失败，已停止继续处理。")
+    raise WpsError(message, code=code, diagnostic=diagnostic)
 
 
 def _data(reply):
@@ -93,7 +138,9 @@ def _data(reply):
 
 def _info(rpc, file_id):
     info = _data(rpc.call_tool("get_file_info", {"file_id": file_id}))
-    if (info.get("id") != file_id or type(info.get("version")) is not int
+    if info.get("id") != file_id:
+        _fail("WORKBOOK_MISMATCH", field="identity")
+    if (type(info.get("version")) is not int
             or info["version"] < 1 or not isinstance(info.get("name"), str)
             or not info["name"].lower().endswith(".xlsx")):
         _fail("UNSUPPORTED_CELL_METADATA")
@@ -105,7 +152,7 @@ def _info(rpc, file_id):
 
 class _NoDownloadRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
-        _fail("REDIRECT_BLOCKED")
+        _fail("REDIRECT_BLOCKED", stage="download")
 
 
 def _download(url, opener=None):
@@ -117,21 +164,21 @@ def _download(url, opener=None):
                 or not host.isascii() or not host.endswith((".ag.kdocs.cn", ".ag.wps.cn"))
                 or not re.fullmatch(r"[a-z0-9.-]+", host)
                 or any(c.isspace() for c in url)):
-            _fail("UNTRUSTED_DOWNLOAD_URL")
+            _fail("UNTRUSTED_DOWNLOAD_URL", stage="download")
         transport = opener or urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoDownloadRedirect())
         # In particular, do not attach SkillHub Authorization to this URL.
         request = urllib.request.Request(url, headers={"Accept": "application/octet-stream"})
         with transport.open(request, timeout=30) as response:
             if getattr(response, "status", 200) != 200:
-                _fail("DOWNLOAD_FAILED")
+                _fail("DOWNLOAD_FAILED", stage="download")
             raw = response.read(MAX_DOWNLOAD_BYTES + 1)
         if not raw or len(raw) > MAX_DOWNLOAD_BYTES:
-            _fail("SNAPSHOT_TOO_LARGE")
+            _fail("SNAPSHOT_TOO_LARGE", stage="download")
         return raw
     except WpsError:
         raise
     except (ValueError, TypeError, urllib.error.URLError, OSError, TimeoutError):
-        _fail("DOWNLOAD_FAILED")
+        _fail("DOWNLOAD_FAILED", stage="download")
 
 
 def _hash_matches(raw, digest):
@@ -170,11 +217,11 @@ def _xml_files(raw):
         return xml
 
 
-def _explicit_styles(xml, sheet_name):
+def _worksheet_metadata(xml, sheet_name):
     book = ElementTree.fromstring(xml["xl/workbook.xml"])
     sheet = next((item for item in book.iter() if item.tag.endswith("}sheet") and item.get("name") == sheet_name), None)
     if sheet is None:
-        _fail()
+        _fail("WORKBOOK_MISMATCH", sheet=sheet_name, field="identity")
     rid = sheet.get("{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id")
     links = ElementTree.fromstring(xml["xl/_rels/workbook.xml.rels"])
     link = next((item for item in links if item.get("Id") == rid), None)
@@ -185,7 +232,36 @@ def _explicit_styles(xml, sheet_name):
     if not path.startswith("xl/worksheets/") or path not in xml:
         _fail("INVALID_SNAPSHOT")
     root = ElementTree.fromstring(xml[path])
-    return {item.get("r") for item in root.iter() if item.tag.endswith("}c") and item.get("s") is not None}
+    namespace = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
+    if root.tag != namespace + "worksheet":
+        _fail("INVALID_SNAPSHOT")
+    explicit, numbers, seen = set(), {}, set()
+    for item in root.findall(namespace + "sheetData/" + namespace + "row/" + namespace + "c"):
+        coordinate = item.get("r")
+        if (not isinstance(coordinate, str) or not re.fullmatch(r"[A-Z]{1,3}[1-9][0-9]{0,6}", coordinate)
+                or coordinate in seen):
+            _fail("INVALID_SNAPSHOT")
+        seen.add(coordinate)
+        if item.get("s") is not None:
+            explicit.add(coordinate)
+        # Preserve the actual stored serial, before openpyxl turns date and
+        # time formats into datetime/timedelta and rounds to milliseconds.
+        # Text, booleans and error cells must retain their original types.
+        if item.get("t", "n") != "n":
+            continue
+        values = item.findall(namespace + "v")
+        if len(values) > 1:
+            _fail("INVALID_SNAPSHOT")
+        if not values or values[0].text is None:
+            continue
+        text = values[0].text
+        if (len(text) > 1024 or not re.fullmatch(r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[Ee][+-]?[0-9]+)?", text)):
+            _fail("INVALID_SNAPSHOT")
+        value = float(text) if any(char in text for char in ".Ee") else int(text)
+        if type(value) is float and not math.isfinite(value):
+            _fail("INVALID_SNAPSHOT")
+        numbers[coordinate] = value
+    return explicit, numbers
 
 
 def _format(sheet, cell, explicit):
@@ -215,19 +291,27 @@ def _same(a, b):
     return (type(a) is type(b) or type(a) in (int, float) and type(b) in (int, float)) and a == b
 
 
-def load_blank_cells(rpc, file_id, sheet_name, missing_coordinates, known_cells, *, expected_version=None, opener=None):
-    """Return metadata only for omitted cells proven empty in the current XLSX.
+def load_blank_cells(rpc, file_id, sheet_name, missing_coordinates, known_cells, *,
+                     expected_version=None, opener=None, metadata_coordinates=()):
+    """Return verified metadata for omitted blanks and requested live cells.
 
     Coordinates are one-based. ``known_cells`` must contain at least one
     nonempty/formula cell from the same live API read for a consistency check.
+    Additional ``metadata_coordinates`` must be supplied in ``known_cells``
+    and are checked exactly against that live read before exposing the XLSX
+    date system. They may be nonempty, so filled dates retain their epoch even
+    when the requested range no longer contains an omitted blank.
     No downloaded business file or signed URL is persisted.
     """
     workbooks = []
     try:
         missing = set(missing_coordinates)
-        coordinates = missing | set(known_cells)
+        requested_metadata = set(metadata_coordinates)
+        requested = missing | requested_metadata
+        coordinates = requested | set(known_cells)
         if (not isinstance(file_id, str) or not _ID.fullmatch(file_id) or not isinstance(sheet_name, str)
-                or not missing or len(missing) > 20000 or len(coordinates) > 20001
+                or not requested or len(requested) > 20000 or len(coordinates) > 20001
+                or not requested_metadata.issubset(known_cells)
                 or any(not isinstance(key, tuple) or len(key) != 2
                        or type(key[0]) is not int or not 1 <= key[0] <= 100000
                        or type(key[1]) is not int or not 1 <= key[1] <= 16384 for key in coordinates)):
@@ -238,7 +322,7 @@ def load_blank_cells(rpc, file_id, sheet_name, missing_coordinates, known_cells,
             _fail("SNAPSHOT_UNVERIFIED")
         before = _info(rpc, file_id)
         if expected_version is not None and before["version"] != expected_version:
-            _fail()
+            _fail(sheet=sheet_name, field="version")
         download = _data(rpc.call_tool("download_file", {"file_id": file_id, "with_hash": True,
                             "internal": False, "storage_base_domain": "wps365.com"}))
         size = download.get("physical_size")
@@ -248,9 +332,9 @@ def load_blank_cells(rpc, file_id, sheet_name, missing_coordinates, known_cells,
         hashes = download.get("hashes")
         if (len(raw) != size or not _hash_matches(raw, before["hash"])
                 or not isinstance(hashes, list) or not any(_hash_matches(raw, digest) for digest in hashes)):
-            _fail()
+            _fail(sheet=sheet_name, field="hash")
         xml = _xml_files(raw)
-        explicit = _explicit_styles(xml, sheet_name)
+        explicit, numbers = _worksheet_metadata(xml, sheet_name)
         book = load_workbook(io.BytesIO(raw), data_only=False, keep_links=False)
         workbooks.append(book)
         cached = load_workbook(io.BytesIO(raw), data_only=True, keep_links=False)
@@ -259,6 +343,9 @@ def load_blank_cells(rpc, file_id, sheet_name, missing_coordinates, known_cells,
             _fail("INVALID_SNAPSHOT")
         sheet, cached_sheet = book[sheet_name], cached[sheet_name]
         merged = list(sheet.merged_cells.ranges)
+        date_system = {CALENDAR_WINDOWS_1900: "1900", CALENDAR_MAC_1904: "1904"}.get(book.epoch)
+        if date_system is None:
+            _fail("UNSUPPORTED_CELL_METADATA")
 
         def metadata(key):
             row, col = key
@@ -266,34 +353,54 @@ def load_blank_cells(rpc, file_id, sheet_name, missing_coordinates, known_cells,
             formula = cell.value if cell.data_type == "f" else ""
             if not isinstance(formula, str):
                 _fail("UNSUPPORTED_CELL_METADATA")
-            return dict(value=_scalar(cached_sheet.cell(row, col).value, book.epoch),
+            value = numbers[cell.coordinate] if cell.coordinate in numbers else _scalar(cached_sheet.cell(row, col).value, book.epoch)
+            return dict(value=value,
                         formula=formula, has_formula=bool(formula), number_format=_format(sheet, cell, explicit),
                         merged=any(area.min_row <= row <= area.max_row and area.min_col <= col <= area.max_col for area in merged))
 
-        for key, expected in anchors.items():
+        checked = anchors | {key: known_cells[key] for key in requested_metadata}
+        for key, expected in checked.items():
             found = metadata(key)
-            if (not _same(found["value"], "" if expected["value"] is None else expected["value"])
-                    or found["formula"] != expected.get("formula", "")
-                    or found["has_formula"] != expected.get("has_formula")
-                    or found["number_format"] != normalize_number_format(expected.get("number_format"))
-                    or found["merged"] != expected.get("merged")):
-                _fail()
+            expected_value = "" if expected["value"] is None else expected["value"]
+            if not _same(found["value"], expected_value):
+                same_type = (type(found["value"]) is type(expected_value)
+                             or type(found["value"]) in (int, float) and type(expected_value) in (int, float))
+                _fail("VALUE_MISMATCH" if same_type else "TYPE_MISMATCH", sheet=sheet_name,
+                      coordinate=key, field="value" if same_type else "type")
+            if found["formula"] != expected.get("formula", "") or found["has_formula"] != expected.get("has_formula"):
+                _fail("FORMULA_MISMATCH", sheet=sheet_name, coordinate=key, field="formula")
+            if found["number_format"] != normalize_number_format(expected.get("number_format")):
+                _fail("FORMAT_MISMATCH", sheet=sheet_name, coordinate=key, field="number_format")
+            if found["merged"] != expected.get("merged"):
+                _fail("MERGE_MISMATCH", sheet=sheet_name, coordinate=key, field="merged")
         result = {}
         for key in missing:
             found = metadata(key)
-            if found["value"] != "" or found["has_formula"]:
-                _fail()
-            result[key] = found
+            if found["has_formula"]:
+                _fail("FORMULA_MISMATCH", sheet=sheet_name, coordinate=key, field="formula")
+            if found["value"] != "":
+                _fail("VALUE_MISMATCH", sheet=sheet_name, coordinate=key, field="value")
+            # A date's displayed format does not reveal its numeric epoch.
+            # Expose only the date system read from this verified workbook.
+            result[key] = dict(found, date_system=date_system)
+        for key in requested_metadata:
+            # These live values were compared exactly above; returning their
+            # metadata must never substitute unverified downloaded business data.
+            result[key] = dict(metadata(key), date_system=date_system)
         after = _info(rpc, file_id)
-        if any(before.get(key) != after.get(key) for key in ("id", "name", "version", "hash")):
-            _fail()
+        if any(before.get(key) != after.get(key) for key in ("id", "name")):
+            _fail("WORKBOOK_MISMATCH", sheet=sheet_name, field="identity")
+        for field in ("version", "hash"):
+            if before.get(field) != after.get(field):
+                _fail(sheet=sheet_name, field=field)
         return result
-    except WpsError:
+    except WpsError as exc:
+        exc.diagnostic = safe_wps_diagnostic({"stage": "snapshot", "sheet": sheet_name, **exc.diagnostic})
         raise
     except Exception:
         # Library/network exceptions can contain the signed URL or workbook
         # content. Keep both out of chat, diagnostic logs and task journals.
-        _fail("INVALID_SNAPSHOT")
+        _fail("INVALID_SNAPSHOT", sheet=sheet_name)
     finally:
         for book in workbooks:
             book.close()

@@ -552,3 +552,70 @@ def test_cloud_call_limit_stops_before_next_write(monkeypatch):
         ai.send("更新表格", [], [], cloud_tools=adapter)
     assert len(adapter.calls) == 2 and len(opener.requests) == 1
     assert len(failure.value.cloud_results) == 2
+
+
+class MappingGateAdapter(FakeCloudTools):
+    def __init__(self):
+        super().__init__()
+        self.source_context = None
+        self.questions = []
+
+    def set_source_context(self, files):
+        self.source_context = files
+
+    def tool_definitions(self):
+        base = super().tool_definitions()[0]
+        return [dict(base, name=name) for name in ("wps_prepare_table_update", "wps_confirm_mapping", "wps_apply")]
+
+    def instructions(self):
+        assert self.source_context is not None
+        return super().instructions()
+
+    def execute(self, name, arguments, *, cancel=None, on_status=None):
+        self.calls.append((name, arguments))
+        if name == "wps_prepare_table_update":
+            return {"ok": False, "status": "needs_mapping", "required_action": "wps_confirm_mapping"}
+        assert name == "wps_confirm_mapping", "Unconfirmed write reached executor"
+        self.questions = [{"kind": "mapping", "question": "请选择来源列", "options": [], "mappings": []}]
+        return {"ok": True, "status": "needs_user_input", "kind": "mapping"}
+
+
+def test_missing_mapping_forces_native_form_and_returns_before_more_model_calls():
+    adapter = MappingGateAdapter()
+    ai, opener = client(sse(function_round(function_call("wps_prepare_table_update", "prepare"))),
+        sse(function_round(function_call("wps_confirm_mapping", "form"))),
+        sse(completed("This extra narration must not be requested")))
+    result = ai.send("更新全部列", [UploadedFile("file-bank", "银行.xlsx", 123)], [], cloud_tools=adapter)
+    assert len(opener.requests) == 2
+    assert json.loads(opener.requests[1].data)["tool_choice"] == {"type": "function", "name": "wps_confirm_mapping"}
+    assert adapter.source_context == [{"file_id": "file-bank", "name": "银行.xlsx", "size": 123}]
+    assert [name for name, _ in adapter.calls] == ["wps_prepare_table_update", "wps_confirm_mapping"]
+    assert "逐行选择来源列" in result.text and adapter.questions
+    assert result.input_tokens == 240 and result.output_tokens == 80
+
+
+def test_model_cannot_report_completion_instead_of_required_mapping_form():
+    adapter = MappingGateAdapter()
+    ai, opener = client(sse(function_round(function_call("wps_prepare_table_update"))),
+                        sse(completed("已完成更新")))
+    with pytest.raises(AIError, match="列对应选择尚未准备"):
+        ai.send("更新全部列", [], [], cloud_tools=adapter)
+    assert len(adapter.calls) == 1
+
+
+def test_required_mapping_rejects_a_different_allowed_function_before_execution():
+    adapter = MappingGateAdapter()
+    ai, opener = client(sse(function_round(function_call("wps_prepare_table_update", "prepare"))),
+                        sse(function_round(function_call("wps_apply", "write"))))
+    with pytest.raises(AIError, match="尚未完成列对应选择"):
+        ai.send("更新全部列", [], [], cloud_tools=adapter)
+    assert [name for name, _ in adapter.calls] == ["wps_prepare_table_update"]
+
+
+def test_native_mapping_form_stops_later_calls_in_same_response():
+    adapter = MappingGateAdapter()
+    ai, opener = client(sse(function_round(function_call("wps_confirm_mapping", "form"),
+                                          function_call("wps_apply", "write"))))
+    result = ai.send("更新全部列", [], [], cloud_tools=adapter)
+    assert "确认全部列对应" in result.text
+    assert [name for name, _ in adapter.calls] == ["wps_confirm_mapping"]
