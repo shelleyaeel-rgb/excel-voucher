@@ -84,14 +84,14 @@ def test_usage_rates_budget_and_readback(tmp_path, monkeypatch):
     assert not path.exists()
     total = ledger.record(1_000_000, 2_000_000, cached_input_tokens=200_000,
                           web_search_calls=2, container_sessions=3)
-    assert total["estimated_usd"] == pytest.approx(1.192)
+    assert total["estimated_usd"] == pytest.approx(33.35)
     assert total["month"] == "2026-10"
     assert total["requests"] == 1
     assert total["cached_input_tokens"] == 200_000
     assert UsageLedger(path).summary() == total
     with pytest.raises(ValueError, match="已达到预算"):
-        ledger.check_budget(1)
-    ledger.check_budget(2)
+        ledger.check_budget(33)
+    ledger.check_budget(34)
     assert ledger.record(0, 0, uncertain=True)["uncertain_requests"] == 1
 
 
@@ -107,6 +107,19 @@ def test_usage_month_rollover_retains_history(tmp_path, monkeypatch):
     assert ledger.summary()["input_tokens"] == 1000
 
 
+def test_model_switch_adds_new_cost_to_the_saved_month(tmp_path, monkeypatch):
+    month = "2026-11"
+    monkeypatch.setattr(ai_settings, "_current_month", lambda: month)
+    path = tmp_path / "usage.json"
+    saved = {"month": month, "requests": 1, "input_tokens": 1000, "output_tokens": 1000,
+             "cached_input_tokens": 0, "web_search_calls": 0, "container_sessions": 0,
+             "estimated_usd": 0.0006, "uncertain_requests": 0}
+    path.write_text(json.dumps({"version": 1, "months": {month: saved}}), encoding="utf-8")
+    summary = UsageLedger(path).record(1000, 1000)
+    assert summary["requests"] == 2
+    assert summary["estimated_usd"] == pytest.approx(0.0006 + 0.012)
+
+
 def test_usage_concurrent_instances_do_not_lose_totals(tmp_path):
     path = tmp_path / "usage.json"
     with ThreadPoolExecutor(max_workers=4) as pool:
@@ -114,7 +127,7 @@ def test_usage_concurrent_instances_do_not_lose_totals(tmp_path):
     total = UsageLedger(path).summary()
     assert total["requests"] == 20
     assert total["input_tokens"] == 20_000
-    assert total["estimated_usd"] == pytest.approx(0.012)
+    assert total["estimated_usd"] == pytest.approx(0.24)
 
 
 @pytest.mark.parametrize("kwargs", [dict(input_tokens=-1, output_tokens=0),

@@ -12,7 +12,7 @@ from pathlib import Path
 
 def run_ai_smoke(app) -> dict:
     from .ai_service import AIResult, FinanceAIClient, GeneratedFile, UploadedFile
-    from .ai_settings import AISettings, UsageLedger, load_settings, save_settings
+    from .ai_settings import MODEL, AISettings, UsageLedger, load_settings, save_settings
     from .ai_rules import load_rules, save_rules
     from .ai_ui import FinanceAIPage
 
@@ -98,7 +98,7 @@ def run_ai_smoke(app) -> dict:
             page.deleteLater()
             app.processEvents()
     from .wps_smoke import run_wps_smoke
-    return {"mode": "offline_mock", "model": "gpt-6-luna", "wps": run_wps_smoke(),
+    return {"mode": "offline_mock", "model": MODEL, "wps": run_wps_smoke(),
             "upload_reply_generated_file": "passed", "source_unchanged": "passed",
             "credential_encryption": "passed", "usage_ledger": "passed",
             "persistent_rules": "passed"}

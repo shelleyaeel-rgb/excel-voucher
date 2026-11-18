@@ -19,7 +19,7 @@ Windows 账务、物流与发票工具，使用 PySide6。银行流水、工资�
 
 这是独立模块，不读取当前公司、已导入的资料或凭证，不执行模型生成的本地代码。用户明确选择附件、发送后，才把附件上传到 OpenAI。云端读取、计算并生成文件；用户选择保存位置后下载结果，不自动导入原业务模块或打开下载文件。用户主动关联已绑定的 WPS 链接后，助手还可通过受控工具读取相关云表数据并提交指定更新，相关数据会用于本次 AI 分析。
 
-1. 点击左侧“财务 AI 助手”，打开“连接设置”，填写 OpenAI API 密钥。模型固定为 `gpt-6-luna`，API 地址固定为官方 `https://api.openai.com/v1`，没有自建中转服务器。
+1. 点击左侧“财务 AI 助手”，打开“连接设置”，填写 OpenAI API 密钥。软件使用固定模型 `gpt-6.2-sol`，请求发送到 OpenAI 官方地址 `https://api.openai.com/v1`。
 2. 默认直连。也支持系统代理和自定义 HTTP/HTTPS 代理；连接由运行软件的电脑发出。点击“测试连接”检查密钥和模型访问权限；连接成功不代表 API 余额足够或文档处理请求一定成功。
 3. 可直接询问财务知识，或选择／拖入 `.xlsx`、`.csv`、`.pdf`、`.docx`、`.pptx`、`.txt`、`.md`、`.png`、`.jpg`、`.jpeg`。每个文件不超过 20 MiB，每次会话最多 10 个附件。旧 `.xls` 请先由用户在 Excel 中另存为 `.xlsx`；助手不会在本机转换文件。
 4. 输入要求后发送，例如“按部门汇总这份工资表，检查合计，并生成 Excel”。财务金额由云端 Code Interpreter 计算；请检查返回的依据、假设、合计和生成文件。模型回答与借贷相等本身均不代表会计处理正确。
@@ -31,11 +31,11 @@ Windows 账务、物流与发票工具，使用 PySide6。银行流水、工资�
 
 API 密钥可仅用于本次打开，也可使用 Windows 当前用户的 DPAPI 加密保存在 `data/finance_ai.json`。密钥不会写入代码、安装包、普通账套设置或日志；加密设置复制到另一台电脑／另一 Windows 用户后需重新输入密钥。发行 ZIP 不包含 `data`。API 调用产生费用，需要可用的 API 余额和模型权限；ChatGPT/Codex 的剩余聊天额度不是 API 余额。
 
-`data/finance_ai_usage.json` 只保存本机按北京时间自然月累计的次数、token 和费用估算，不保存聊天或附件正文。默认预算为 20 美元；发送前达到估算预算则暂停。它不是账户余额查询或平台硬性限额：未完成／取消请求、云端处理时间、其它设备用量和价格变动均可能导致估算与账单不同，单次请求也可能跨过预算。取消只停止本机等待，不保证取消服务器处理或计费。
+`data/finance_ai_usage.json` 只保存本机按北京时间自然月累计的次数、token 和费用估算，不保存聊天或附件正文。默认月预算为 20 美元，发送前估算金额已达到预算时，软件会暂停新请求。新请求按 GPT-6.2 Sol 的标准价格估算，之前已记录的金额按原值累计。软件根据每次请求的输入量选择普通或长上下文价格，并区分普通输入、缓存读取、缓存写入和输出。单次请求也可能跨过预算。中断的请求、云端处理时间、其他设备的用量和价格变动都可能让估算与账单有差异。实际费用和账户余额以 OpenAI 为准。取消只停止本机等待，云端仍可能继续处理并计费。
 
 模型可使用云端文档处理、可选网页查询，以及本次用户关联的 WPS 文档工具；不提供本地文件搜索、终端、宏、数据库或凭证写入工具。WPS 令牌和 webhook 由软件使用，不发送给模型。非财务及无关文档请求由助手规则限制，该限制不应被当作模型永远不会偏离主题的保证。对话仅保留于本次软件运行的内存中，云文档修改记录单独持久保存。
 
-接口参考：[Luna](https://developers.openai.com/api/docs/models/gpt-6-luna)、[Code Interpreter](https://developers.openai.com/api/docs/guides/tools-code-interpreter)、[API 价格](https://developers.openai.com/api/docs/pricing)。
+官方文档列出了模型支持的工具和计费标准。[GPT-6.2 Sol](https://developers.openai.com/api/docs/models/gpt-6.2-sol) · [Code Interpreter](https://developers.openai.com/api/docs/guides/tools-code-interpreter) · [API 价格](https://developers.openai.com/api/docs/pricing)
 
 ### 更新 WPS 云文档（0.6.3）
 
@@ -132,7 +132,7 @@ assets 中的图标、账套模板、公开更新配置以及独立更新器随�
 - `ui.py` / `theme.py`：粉色桌面界面、异步任务、预览失效保护。
 - `config.py`：便携模式本地设置。
 - `ai_ui.py`：独立财务助手页面、附件、异步请求与手动下载。
-- `ai_service.py`：固定 Luna 的官方 API 连接、云端文件处理、流式响应与下载。
+- `ai_service.py` 负责连接 OpenAI、发送财务助手请求、处理流式响应和下载云端文件。
 - `ai_settings.py`：Windows 密钥加密保存与独立月度用量估算。
 - `ai_rules.py`：独立保存、读取和校验财务助手的长期规则。
 - `wps_service.py` / `assets/wps_airscript.js`：加密文档绑定、兼容旧版 WPS HTTP 接口和通用云端脚本。
@@ -157,4 +157,4 @@ $p.ExitCode
 ```
 
 自检使用合成数据验证内置模板、科目名称解析、无效科目非阻断、两种 Excel 格式往返、四类资料列对应、重复导入、公司隔离、资料导出与 GUI 初始化；另以离线模拟服务验证财务助手的上传、回答、生成文件列表、源文件保护、密钥加密、用量记录和长期规则，以及 WPS 配套脚本打包、账号及绑定加密、账号接口适配、自动表头定位、集中列对应确认、多列完整任务、回读与重启后只读核对。开发环境中的旧版 WPS 跨层测试使用 Node.js 执行真实 AirScript 代码的合成工作簿；运行免安装程序不需要 Node.js。
-自检不会连接 OpenAI、读取用户源表或修改用户配置，报告中的 `finance_ai.mode` 为 `offline_mock`。真实账号的 Luna、云端文件处理权限、余额和生成质量须在填写密钥后另外验证。
+自检不会连接 OpenAI、读取用户源表或修改用户配置，报告中的 `finance_ai.mode` 为 `offline_mock`。填写密钥后，可点击“测试 AI 连接”检查当前项目对 `gpt-6.2-sol` 的访问权限。云端文件处理和生成质量需通过实际请求验证。

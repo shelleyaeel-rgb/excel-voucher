@@ -24,11 +24,10 @@ from urllib.parse import quote, urlsplit
 from urllib.request import HTTPRedirectHandler, HTTPSHandler, ProxyHandler, Request, build_opener
 
 from .ai_rules import validate_rules
-from .ai_settings import AISettings, validate_settings
+from .ai_settings import MODEL, AISettings, TokenUsage, validate_settings
 
 
 API_BASE = "https://api.openai.com/v1"
-MODEL = "gpt-6-luna"
 MAX_UPLOAD_BYTES = 20 * 1024 * 1024
 MAX_DOWNLOAD_BYTES = 50 * 1024 * 1024
 MAX_FILES = 10
@@ -125,6 +124,11 @@ class AIResult:
     output_items: list[dict] = field(default_factory=list, repr=False, compare=False)
     function_calls: list[dict] = field(default_factory=list, repr=False, compare=False)
     container_ids: list[str] = field(default_factory=list, repr=False, compare=False)
+    usage_by_response: list[TokenUsage] = field(default_factory=list, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        if not self.usage_by_response and (self.input_tokens or self.output_tokens):
+            self.usage_by_response.append(TokenUsage(self.input_tokens, self.output_tokens, self.cached_input_tokens))
 
 
 class _NoRedirect(HTTPRedirectHandler):
@@ -209,7 +213,7 @@ def _stream_error_message(event: dict) -> str:
     if code in {"invalid_api_key", "authentication_error", "unauthorized"} or error_type == "authentication_error":
         return _error_message(401, code)
     if code == "model_not_found":
-        return "当前 API 项目无法使用 Luna，请检查账号、项目和模型权限。"
+        return f"当前 API 项目无法使用 {MODEL}，请检查账号、项目和模型权限。"
     if code in {"permission_denied", "insufficient_permissions", "organization_restricted", "access_denied"} or error_type == "permission_error":
         return _error_message(403, code)
     if code in {"server_error", "internal_server_error", "internal_error", "service_unavailable"}:
@@ -430,8 +434,8 @@ class FinanceAIClient:
     def test_connection(self) -> str:
         model = self._json("GET", "/models/" + MODEL)
         if model.get("id") != MODEL:
-            raise AIError("未能确认 Luna 的模型权限，请检查 API 项目设置。")
-        return "连接成功，当前密钥可以访问 Luna。此测试不消耗模型用量，也不代表 API 余额充足。"
+            raise AIError(f"未能确认 {MODEL} 的模型权限，请检查 API 项目设置。")
+        return f"连接成功，当前密钥可以访问 {MODEL}。此测试不消耗模型用量，也不代表 API 余额充足。"
 
     def upload_file(self, path: Path, cancel: threading.Event | None = None) -> UploadedFile:
         _check_cancel(cancel)
@@ -539,7 +543,7 @@ class FinanceAIClient:
             return self._send_with_cloud_tools(payload, files, container_id, cloud_tools,
                                                cancel, on_text, on_status)
         if on_status:
-            on_status("正在连接 Luna…")
+            on_status(f"正在连接 {MODEL}…")
         try:
             with self._request("POST", "/responses", data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
                                stream=True, cancel=cancel, billed=True) as response:
@@ -639,13 +643,14 @@ class FinanceAIClient:
                     raise AIError("本次云文档数据过多，请缩小处理范围；已执行结果保留在任务记录中。",
                                   request_may_be_billed=round_index > 0)
                 if on_status:
-                    on_status("正在连接 Luna…" if round_index == 0 else "正在继续分析云文档处理结果…")
+                    on_status(f"正在连接 {MODEL}…" if round_index == 0 else "正在继续分析云文档处理结果…")
                 with self._request("POST", "/responses", data=body,
                                    stream=True, cancel=cancel, billed=True) as response:
                     result = self._read_stream(response, aggregate.container_id, cancel, on_text, on_status)
                 aggregate.input_tokens += result.input_tokens
                 aggregate.output_tokens += result.output_tokens
                 aggregate.cached_input_tokens += result.cached_input_tokens
+                aggregate.usage_by_response.extend(result.usage_by_response)
                 aggregate.web_search_calls += result.web_search_calls
                 for cid in result.container_ids:
                     if cid not in known_containers:
@@ -869,9 +874,16 @@ class FinanceAIClient:
         details = usage.get("input_tokens_details")
         details = details if isinstance(details, dict) else {}
         input_tokens = _count(usage.get("input_tokens"))
+        output_tokens = _count(usage.get("output_tokens"))
+        cached_tokens = min(_count(details.get("cached_tokens")), input_tokens)
+        writes = min(_count(details.get("cache_write_tokens")), input_tokens - cached_tokens)
+        lifetimes = details.get("cache_write_tokens_details")
+        lifetimes = lifetimes if isinstance(lifetimes, dict) else {}
+        writes_12h = min(_count(lifetimes.get("ttl_12h_tokens")), writes)
+        token_usage = TokenUsage(input_tokens, output_tokens, cached_tokens, writes - writes_12h, writes_12h)
         return AIResult(text=text, files=files, input_tokens=input_tokens,
-                        output_tokens=_count(usage.get("output_tokens")),
-                        cached_input_tokens=min(_count(details.get("cached_tokens")), input_tokens),
+                        output_tokens=output_tokens, cached_input_tokens=cached_tokens,
+                        usage_by_response=[token_usage],
                         web_search_calls=searches,
                         container_sessions=len([cid for cid in containers if cid != previous_container_id]),
                         container_id=containers[-1] if containers else previous_container_id,

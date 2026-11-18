@@ -22,6 +22,7 @@ from urllib.parse import urlsplit
 from .config import data_dir
 
 
+MODEL = "gpt-6.2-sol"
 _LOCK = threading.RLock()
 _ENTROPY = b"XiaoYuVoucher/FinanceAI/APIKey/v1"
 _CST = timezone(timedelta(hours=8))
@@ -204,6 +205,36 @@ def _counter(value: int) -> int:
     return value
 
 
+@dataclass(frozen=True)
+class TokenUsage:
+    """Billed tokens for one Responses API call, before combining tool rounds."""
+
+    input_tokens: int
+    output_tokens: int
+    cached_input_tokens: int = 0
+    cache_write_30m_tokens: int = 0
+    cache_write_12h_tokens: int = 0
+
+    def estimated_usd(self) -> Decimal:
+        for count in (self.input_tokens, self.output_tokens, self.cached_input_tokens,
+                      self.cache_write_30m_tokens, self.cache_write_12h_tokens):
+            _counter(count)
+        written = self.cache_write_30m_tokens + self.cache_write_12h_tokens
+        ordinary = self.input_tokens - self.cached_input_tokens - written
+        if ordinary < 0:
+            raise ValueError("缓存读取和写入量之和不能超过总输入量。")
+        # Standard rates per million tokens: https://developers.openai.com/api/docs/models/gpt-6.2-sol
+        if self.input_tokens > 272_000:
+            input_rate, output_rate = 4, 15
+        else:
+            input_rate, output_rate = 2, 10
+        input_cost = input_rate * (
+            ordinary + self.cached_input_tokens * Decimal("0.05")
+            + self.cache_write_30m_tokens * Decimal("1.25") + self.cache_write_12h_tokens * Decimal("2.5")
+        )
+        return (input_cost + self.output_tokens * output_rate) / 1_000_000
+
+
 def _empty_summary(month: str) -> dict:
     return dict(month=month, requests=0, input_tokens=0, output_tokens=0,
                 cached_input_tokens=0, web_search_calls=0, container_sessions=0,
@@ -243,27 +274,25 @@ class UsageLedger:
     def record(self, input_tokens: int, output_tokens: int, cached_input_tokens: int = 0,
                web_search_calls: int = 0, container_sessions: int = 0,
                uncertain: bool = False) -> dict:
-        for value in (input_tokens, output_tokens, cached_input_tokens, web_search_calls, container_sessions):
-            _counter(value)
-        if cached_input_tokens > input_tokens:
-            raise ValueError("缓存输入量不能超过总输入量。")
+        return self.record_responses([TokenUsage(input_tokens, output_tokens, cached_input_tokens)],
+                                     web_search_calls, container_sessions, uncertain)
+
+    def record_responses(self, responses: list[TokenUsage], web_search_calls: int = 0,
+                         container_sessions: int = 0, uncertain: bool = False) -> dict:
+        _counter(web_search_calls)
+        _counter(container_sessions)
         if not isinstance(uncertain, bool):
             raise ValueError("用量不确定标记格式不正确。")
-        cost = (
-            Decimal(input_tokens - cached_input_tokens) * Decimal("0.10") / 1_000_000
-            + Decimal(cached_input_tokens) * Decimal("0.01") / 1_000_000
-            + Decimal(output_tokens) * Decimal("0.50") / 1_000_000
-            + Decimal(web_search_calls) * Decimal("0.01")
-            + Decimal(container_sessions) * Decimal("0.03")
-        )
+        cost = web_search_calls * Decimal("0.01") + container_sessions * Decimal("0.03")
+        cost += sum(response.estimated_usd() for response in responses)
         with _LOCK:
             value = self._load()
             month = _current_month()
             summary = value["months"].setdefault(month, _empty_summary(month))
             summary["requests"] += 1
-            summary["input_tokens"] += input_tokens
-            summary["output_tokens"] += output_tokens
-            summary["cached_input_tokens"] += cached_input_tokens
+            summary["input_tokens"] += sum(response.input_tokens for response in responses)
+            summary["output_tokens"] += sum(response.output_tokens for response in responses)
+            summary["cached_input_tokens"] += sum(response.cached_input_tokens for response in responses)
             summary["web_search_calls"] += web_search_calls
             summary["container_sessions"] += container_sessions
             summary["uncertain_requests"] += int(uncertain)

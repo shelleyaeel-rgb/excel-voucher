@@ -21,8 +21,8 @@ from PySide6.QtWidgets import (
     QScrollArea, QSizePolicy, QSpinBox, QSplitter, QTabWidget, QTextBrowser, QVBoxLayout, QWidget,
 )
 
-from .ai_service import AIError, FinanceAIClient, RequestCancelled
-from .ai_settings import AISettings, UsageLedger, load_settings, save_settings, validate_settings
+from .ai_service import AIError, AIResult, FinanceAIClient, RequestCancelled
+from .ai_settings import MODEL, AISettings, UsageLedger, load_settings, save_settings, validate_settings
 from .ai_rules import MAX_RULES_CHARS, load_rules, save_rules, validate_rules
 from .config import data_dir
 from .wps_service import WpsError, extract_share_links, load_bindings, normalize_share_url
@@ -219,7 +219,7 @@ class AISettingsDialog(QDialog):
         self.setMinimumWidth(520)
         layout = QVBoxLayout(self)
         layout.addWidget(_label('连接 OpenAI', 'sectionTitle'))
-        layout.addWidget(_label('模型固定为 Luna。更换密钥或连接方式后，会开启新对话。', 'muted', True))
+        layout.addWidget(_label(f'模型固定为 {MODEL}。更换密钥或连接方式后，会开启新对话。', 'muted', True))
         form = QFormLayout()
         self.key_edit = QLineEdit(settings.api_key)
         self.key_edit.setEchoMode(QLineEdit.EchoMode.Password)
@@ -251,7 +251,7 @@ class AISettingsDialog(QDialog):
         self.output_spin.setValue(settings.max_output_tokens)
         form.addRow('单次输出上限（token）', self.output_spin)
         layout.addLayout(form)
-        layout.addWidget(_label('token 是模型读写内容的计费单位。费用为本软件估算，实际金额以 OpenAI 账单为准。'
+        layout.addWidget(_label(f'token 是模型读写内容的计费单位。预算按 {MODEL} 的标准价格估算，实际费用以 OpenAI 账单为准。'
                                 '达到上限后停止发起新请求，已发出的请求仍可能产生费用。', 'small', True))
         self.error_label = _label('', 'notice', True)
         self.error_label.hide()
@@ -454,7 +454,7 @@ class FinanceAIPage(QWidget):
         layout.setSpacing(10)
         title = QHBoxLayout()
         title.addWidget(_label('财务 AI 助手', 'hero'))
-        title.addWidget(_label('Luna · 云端处理', 'muted'))
+        title.addWidget(_label(f'{MODEL} · 云端处理', 'muted'))
         title.addStretch()
         self.new_chat_button = _button('新对话', self.new_chat)
         self.settings_button = _button('AI 连接设置', self.open_settings)
@@ -1189,7 +1189,7 @@ class FinanceAIPage(QWidget):
         self.messages.append(('user', message + ('\n附件：' + '、'.join(p.name for p in pending) if pending else '')))
         self.messages.append(('assistant', ''))
         self._render_chat()
-        self._status('正在上传并处理…' if pending else '正在连接 Luna…')
+        self._status('正在上传并处理…' if pending else f'正在连接 {MODEL}…')
 
         def work(job):
             new_uploads = []
@@ -1225,7 +1225,7 @@ class FinanceAIPage(QWidget):
         except (AIError, ValueError) as exc:
             self._status(exc, error=True)
             return
-        self._status('正在检测连接和 Luna 模型权限…')
+        self._status(f'正在检测连接和 {MODEL} 模型权限…')
         self._start_job('test', lambda job: client.test_connection())
 
     def cancel_request(self):
@@ -1271,10 +1271,7 @@ class FinanceAIPage(QWidget):
         kind = self._job.kind
         if kind == 'send':
             try:
-                self.ledger.record(result.input_tokens, result.output_tokens,
-                                   cached_input_tokens=result.cached_input_tokens,
-                                   web_search_calls=result.web_search_calls,
-                                   container_sessions=result.container_sessions)
+                self.ledger.record_responses(result.usage_by_response, result.web_search_calls, result.container_sessions)
             except (ValueError, OSError):
                 self.messages.append(('notice', '本次用量未能保存，请以 OpenAI 账单为准。'))
             self._job.result_accounted = True
@@ -1324,9 +1321,12 @@ class FinanceAIPage(QWidget):
             self._show_cloud_questions()
             if cloud_results:
                 text += '\n云文档执行记录已保留：' + self._cloud_result_text(cloud_results[-1])
-            if getattr(exc, 'request_may_be_billed', False):
+            partial = getattr(exc, 'partial_result', None) or AIResult(text='')
+            uncertain = getattr(exc, 'request_may_be_billed', False)
+            if uncertain or partial.usage_by_response:
                 try:
-                    self.ledger.record(0, 0, uncertain=True)
+                    self.ledger.record_responses(partial.usage_by_response, partial.web_search_calls,
+                                                 partial.container_sessions, uncertain=uncertain)
                 except (ValueError, OSError):
                     pass
                 self._job.result_accounted = True

@@ -264,6 +264,7 @@ def test_mapping_gate_error_discards_only_current_stream_and_keeps_cloud_records
         def send(self, message, files, history, **kwargs):
             kwargs['on_text']('全部已经更新成功。')
             error = AIError('尚未选择全部列对应，请先逐行选择。')
+            error.partial_result = AIResult(text='', input_tokens=1000, output_tokens=100)
             if discard_partial:
                 error.discard_partial_text = True
             error.cloud_results = [dict(record)]
@@ -281,6 +282,7 @@ def test_mapping_gate_error_discards_only_current_stream_and_keeps_cloud_records
     assert (('assistant', '全部已经更新成功。') in page.messages) is (not discard_partial)
     assert page.messages[-1][0] == 'notice' and '尚未选择全部列对应' in page.messages[-1][1]
     assert page.cloud_result_list.count() == 1 and page.cloud_results[0]['updated'] == 2
+    assert page.ledger.summary()['estimated_usd'] == pytest.approx(0.003)
     if discard_partial:
         assert page._partial_text == ''
         assert '全部已经更新成功。' not in page.transcript.toPlainText()

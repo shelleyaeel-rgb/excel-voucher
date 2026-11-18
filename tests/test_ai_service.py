@@ -11,7 +11,7 @@ import pytest
 from xiaoyu import ai_service as service
 from xiaoyu.ai_rules import MAX_RULES_CHARS
 from xiaoyu.ai_service import AIError, AIResult, FinanceAIClient, GeneratedFile, RequestCancelled, UploadedFile
-from xiaoyu.ai_settings import AISettings
+from xiaoyu.ai_settings import AISettings, UsageLedger
 
 
 class Reply(io.BytesIO):
@@ -62,11 +62,11 @@ def citation(name="汇总.xlsx", file_id="cfile-result", container="cntr-one"):
 
 
 def test_connection_is_only_read_only_model_lookup():
-    ai, opener = client(json_reply({"id": "gpt-6-luna"}))
+    ai, opener = client(json_reply({"id": "gpt-6.2-sol"}))
     message = ai.test_connection()
-    assert "连接成功" in message and "不代表 API 余额充足" in message
+    assert "连接成功" in message and "gpt-6.2-sol" in message and "不代表 API 余额充足" in message
     assert [(r.method, r.full_url, r.data) for r in opener.requests] == [
-        ("GET", "https://api.openai.com/v1/models/gpt-6-luna", None)]
+        ("GET", "https://api.openai.com/v1/models/gpt-6.2-sol", None)]
 
 
 def test_direct_mode_does_not_inherit_environment_proxy(monkeypatch):
@@ -140,7 +140,7 @@ def test_stream_tool_flow_extracts_usage_and_downloads_from_verified_citation():
                               120, 40, 20, 1, 1, "cntr-one")
     assert chunks == ["已完成"] and any("云端" in status for status in statuses)
     payload = json.loads(opener.requests[0].data)
-    assert payload["model"] == "gpt-6-luna" and payload["store"] is False and payload["stream"] is True
+    assert payload["model"] == "gpt-6.2-sol" and payload["store"] is False and payload["stream"] is True
     assert payload["tools"] == [{"type": "code_interpreter", "container": {
         "type": "auto", "memory_limit": "1g", "file_ids": ["file-payroll"]}}, {"type": "web_search"}]
     assert payload["max_tool_calls"] == 8
@@ -248,7 +248,7 @@ def test_incomplete_or_failed_stream_never_becomes_success(events):
     ("insufficient_quota", "invalid_request_error", "API 可用额度不足"),
     ("credit_balance_exhausted", "insufficient_quota", "API 可用额度不足"),
     ("permission_denied", "permission_error", "OpenAI 拒绝访问"),
-    ("model_not_found", "invalid_request_error", "当前 API 项目无法使用 Luna"),
+    ("model_not_found", "invalid_request_error", "当前 API 项目无法使用 gpt-6.2-sol"),
     ("unknown_provider_code", "unknown", "OpenAI 未能完成本次处理"),
 ])
 def test_nested_stream_errors_classified_without_exposing_payload(kind, nested, code, error_type, expected):
@@ -295,7 +295,7 @@ def test_api_error_hides_provider_payload_and_never_retries():
 
 
 def test_redirect_is_reported_without_disclosing_credentials():
-    failure = HTTPError("https://api.openai.com/v1/models/gpt-6-luna", 302, "Redirect", {}, io.BytesIO(b""))
+    failure = HTTPError("https://api.openai.com/v1/models/gpt-6.2-sol", 302, "Redirect", {}, io.BytesIO(b""))
     ai, opener = client(failure)
     with pytest.raises(AIError, match="跳转"):
         ai.test_connection()
@@ -428,6 +428,7 @@ def test_cloud_function_loop_replays_reasoning_outputs_and_aggregates_usage():
     assert result.cloud_results is not adapter.results
     assert result.files == [GeneratedFile("cntr-one", "cfile-result", "汇总.xlsx")]
     payloads = [json.loads(request.data) for request in opener.requests]
+    assert all(payload["model"] == "gpt-6.2-sol" for payload in payloads)
     assert all(payload["include"] == ["reasoning.encrypted_content"] for payload in payloads)
     assert all(payload["store"] is False and payload["parallel_tool_calls"] is False for payload in payloads)
     assert reasoning in payloads[1]["input"]
@@ -443,6 +444,22 @@ def test_function_calls_are_rejected_without_application_adapter():
     with pytest.raises(AIError, match="没有提供"):
         ai.send("财务问题", [], [])
     assert len(opener.requests) == 1
+
+
+def test_cloud_rounds_are_priced_separately_at_the_context_boundary(tmp_path):
+    first_round = function_round(function_call())
+    final_round = completed("已核对")
+    for event, inputs in [(first_round, 272_000), (final_round, 272_001)]:
+        event["response"]["usage"] = {
+            "input_tokens": inputs, "output_tokens": 10_000,
+            "input_tokens_details": {"cached_tokens": 10_000, "cache_write_tokens": 20_000,
+                                    "cache_write_tokens_details": {"ttl_30m_tokens": 10_000, "ttl_12h_tokens": 10_000}},
+        }
+    ai, _ = client(sse(first_round), sse(final_round))
+    result = ai.send("核对云表", [], [], cloud_tools=FakeCloudTools())
+    summary = UsageLedger(tmp_path / "usage.json").record_responses(result.usage_by_response)
+    assert summary["requests"] == 1 and summary["input_tokens"] == 544_001
+    assert summary["estimated_usd"] == pytest.approx(0.66 + 1.270004)
 
 
 @pytest.mark.parametrize("arguments", [
